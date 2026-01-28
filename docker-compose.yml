@@ -1,0 +1,20 @@
+services:
+  api-gateway:
+    build: .
+    container_name: ai-api-gateway
+    ports:
+      - "6010:6010"
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - TZ=Asia/Shanghai
+      - LOG_LEVEL=INFO
+      - FLASK_ENV=production
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6010/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
