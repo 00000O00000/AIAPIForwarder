@@ -4,7 +4,7 @@
 
 import random
 import logging
-from typing import Optional, List, Tuple
+from typing import Optional, List, Dict, Tuple
 from .config import ConfigManager, UsageManager
 from .rate_limiter import RateLimiter
 from .models import ProviderConfig, ProviderStatus
@@ -19,8 +19,6 @@ class ProviderManager:
         self.config_manager = config_manager
         self.usage_manager = UsageManager()
         self.rate_limiter = RateLimiter(config_manager, self.usage_manager)
-        # 记录提供商临时错误状态
-        self._error_providers: dict = {}  # {(model, provider): error_count}
     
     def get_available_models(self) -> List[str]:
         """获取所有可用模型"""
@@ -113,50 +111,23 @@ class ProviderManager:
         """记录成功请求"""
         self.rate_limiter.record_usage(model_name, provider_name, 
                                        requests=1, tokens=tokens)
-        # 清除错误计数
-        key = (model_name, provider_name)
-        if key in self._error_providers:
-            del self._error_providers[key]
     
-    def record_error(self, model_name: str, provider_name: str):
-        """记录错误"""
-        key = (model_name, provider_name)
-        self._error_providers[key] = self._error_providers.get(key, 0) + 1
-        logger.warning(f"Error recorded for {provider_name}, "
-                      f"count: {self._error_providers[key]}")
+    def record_stream_tokens(self, model_name: str, provider_name: str, tokens: int):
+        """记录流式请求结束后的 token 使用量（不增加请求数）"""
+        self.rate_limiter.record_usage(model_name, provider_name,
+                                       requests=0, tokens=tokens)
     
-    def should_retry(self, model_name: str, provider_name: str, 
-                     status_code: int, attempt: int) -> Tuple[bool, bool]:
+    def get_providers_by_priority(self, model_name: str) -> Dict[int, List[ProviderConfig]]:
         """
-        判断是否应该重试
+        获取按优先级分组的提供商列表
         
         Returns:
-            (should_retry, should_switch_provider)
-            - should_retry: 是否应该重试当前提供商
-            - should_switch_provider: 是否应该切换提供商
+            {priority: [provider_configs]} 字典
         """
-        provider = self.get_provider_by_name(model_name, provider_name)
-        if not provider:
-            return False, True
-        
-        max_retry = provider.retry
-        
-        # 5xx 错误：服务端错误，可以重试当前提供商
-        if 500 <= status_code < 600:
-            if attempt < max_retry:
-                return True, False
-            else:
-                return False, True
-        
-        # 4xx 错误：客户端错误（通常是限额等），切换提供商
-        if 400 <= status_code < 500:
-            # 401/403 认证错误，直接切换
-            if status_code in [401, 403]:
-                return False, True
-            # 429 限流，切换提供商
-            if status_code == 429:
-                return False, True
-            # 其他4xx错误可能是请求问题，不重试
-            return False, False
-        
-        return False, False
+        providers = self.config_manager.get_providers(model_name)
+        groups: Dict[int, List[ProviderConfig]] = {}
+        for p in providers:
+            if p.priority not in groups:
+                groups[p.priority] = []
+            groups[p.priority].append(p)
+        return groups
