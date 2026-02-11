@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # 初始化组件
 config_manager = ConfigManager()
 usage_manager = UsageManager()
-provider_manager = ProviderManager(config_manager)
+provider_manager = ProviderManager(config_manager, usage_manager)
 proxy = OpenAIProxy(provider_manager)
 scheduler = UsageResetScheduler(config_manager, usage_manager)
 

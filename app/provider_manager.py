@@ -4,7 +4,7 @@
 
 import random
 import logging
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict
 from .config import ConfigManager, UsageManager
 from .rate_limiter import RateLimiter
 from .models import ProviderConfig, ProviderStatus
@@ -15,9 +15,9 @@ logger = logging.getLogger(__name__)
 class ProviderManager:
     """提供商管理器"""
     
-    def __init__(self, config_manager: ConfigManager):
+    def __init__(self, config_manager: ConfigManager, usage_manager: UsageManager = None):
         self.config_manager = config_manager
-        self.usage_manager = UsageManager()
+        self.usage_manager = usage_manager or UsageManager()
         self.rate_limiter = RateLimiter(config_manager, self.usage_manager)
     
     def get_available_models(self) -> List[str]:

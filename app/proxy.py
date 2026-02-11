@@ -5,7 +5,7 @@
 import json
 import logging
 import httpx
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Tuple
 from flask import Request, Response, stream_with_context
 
 from .provider_manager import ProviderManager

@@ -69,6 +69,7 @@ class UsageResetScheduler:
                 id=job_id,
                 replace_existing=True
             )
+            self._jobs[job_id] = True
             
             # 计算下次执行时间
             cron = croniter(cron_expr, datetime.now())
@@ -87,14 +88,15 @@ class UsageResetScheduler:
     
     def reload(self):
         """重新加载定时任务"""
-        # 移除所有现有任务
+        # 移除所有已注册的定时任务
         for job_id in list(self._jobs.keys()):
             try:
                 self.scheduler.remove_job(job_id)
-            except:
+                logger.debug(f"Removed job: {job_id}")
+            except Exception:
                 pass
         self._jobs.clear()
         
         # 重新设置任务
         self._setup_jobs()
-        logger.info("Scheduler reloaded")
+        logger.info(f"Scheduler reloaded, {len(self._jobs)} jobs configured")

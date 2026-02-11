@@ -2,7 +2,7 @@
 数据模型定义
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from enum import Enum
 
