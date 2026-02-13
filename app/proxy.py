@@ -5,7 +5,7 @@
 import json
 import logging
 import httpx
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any
 from flask import Request, Response, stream_with_context
 
 from .provider_manager import ProviderManager
@@ -49,6 +49,11 @@ class OpenAIProxy:
         
         if not body:
             return self._error_response(400, "Request body is required")
+        
+        if not isinstance(body, dict):
+            return self._error_response(400, "Request body must be a JSON object")
+        
+        body = self._normalize_request_body(body)
         
         model_name = body.get("model")
         if not model_name:
@@ -474,3 +479,39 @@ class OpenAIProxy:
             status=status_code,
             content_type="application/json"
         )
+    
+    def _normalize_request_body(self, body: dict) -> dict:
+        """
+        宽容处理对结果影响较小的参数格式，减少上游 400。
+        当前规则：
+        - stop: 兼容 null/字符串/数组；不限制数组长度；单元素数组转字符串；无效值移除
+        """
+        normalized = body.copy()
+        
+        if "stop" in normalized:
+            normalized_stop = self._normalize_stop(normalized.get("stop"))
+            if normalized_stop is None:
+                normalized.pop("stop", None)
+            else:
+                normalized["stop"] = normalized_stop
+        
+        return normalized
+    
+    @staticmethod
+    def _normalize_stop(stop_value: Any) -> Optional[Any]:
+        """宽容解析 stop 字段。"""
+        if stop_value is None:
+            return None
+        
+        if isinstance(stop_value, str):
+            return stop_value
+        
+        if isinstance(stop_value, (list, tuple, set)):
+            stops = [item for item in stop_value if isinstance(item, str)]
+            if not stops:
+                return None
+            if len(stops) == 1:
+                return stops[0]
+            return stops
+        
+        return None
