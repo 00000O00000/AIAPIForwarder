@@ -67,15 +67,16 @@ class OpenAIProxy:
         route_model: Optional[str] = None,
         route_stream: Optional[bool] = None,
     ) -> Response:
+        error_client_format = forced_client_format or CLIENT_FORMAT_OPENAI
         try:
             body = request.get_json()
         except Exception as exc:
-            return self._error_response(400, f"Invalid JSON body: {exc}")
+            return self._error_response_for_client(400, f"Invalid JSON body: {exc}", error_client_format)
 
         if not body:
-            return self._error_response(400, "Request body is required")
+            return self._error_response_for_client(400, "Request body is required", error_client_format)
         if not isinstance(body, dict):
-            return self._error_response(400, "Request body must be a JSON object")
+            return self._error_response_for_client(400, "Request body must be a JSON object", error_client_format)
 
         client_format = forced_client_format or self._detect_client_format(body, endpoint)
         canonical_body = self._convert_client_request_to_openai(
@@ -89,65 +90,82 @@ class OpenAIProxy:
 
         model_name = canonical_body.get("model")
         if not model_name:
-            return self._error_response(400, "Model field is required")
+            return self._error_response_for_client(400, "Model field is required", client_format)
 
-        is_stream = bool(canonical_body.get("stream", False))
-        priority_groups = self.provider_manager.get_providers_by_priority(model_name)
-        if not priority_groups:
-            return self._error_response(502, f"No available upstream providers for model: {model_name}")
+        acquired, acquire_reason = self.provider_manager.try_acquire_model_worker(model_name)
+        if not acquired:
+            logger.info("Skip model %s due to max_worker limit: %s", model_name, acquire_reason)
+            return self._error_response_for_client(429, acquire_reason, client_format)
 
-        last_error = None
-        for priority in sorted(priority_groups.keys()):
-            providers = priority_groups[priority]
-            remaining = {p.name: p.retry + 1 for p in providers}
-            skipped = set()
+        release_on_close = False
+        try:
+            is_stream = bool(canonical_body.get("stream", False))
+            priority_groups = self.provider_manager.get_providers_by_priority(model_name)
+            if not priority_groups:
+                return self._error_response_for_client(
+                    502,
+                    f"No available upstream providers for model: {model_name}",
+                    client_format,
+                )
 
-            while True:
-                round_attempted = False
-                for provider in providers:
-                    if provider.name in skipped or remaining[provider.name] <= 0:
-                        continue
+            last_error = None
+            for priority in sorted(priority_groups.keys()):
+                providers = priority_groups[priority]
+                remaining = {p.name: p.retry + 1 for p in providers}
+                skipped = set()
 
-                    status, reason = self.provider_manager.rate_limiter.check_availability(model_name, provider)
-                    if status != ProviderStatus.AVAILABLE:
-                        skipped.add(provider.name)
-                        logger.debug("Provider %s unavailable: %s", provider.name, reason)
-                        continue
+                while True:
+                    round_attempted = False
+                    for provider in providers:
+                        if provider.name in skipped or remaining[provider.name] <= 0:
+                            continue
 
-                    provider_format = provider.format
-                    direct_stream = self._is_direct_stream_compatible(client_format, provider_format)
-                    force_non_stream_for_format = is_stream and provider.non_stream_support and not direct_stream
-                    need_convert_stream = is_stream and (not provider.stream_support or force_non_stream_for_format)
-                    need_convert_non_stream = (not is_stream) and (not provider.non_stream_support)
+                        status, reason = self.provider_manager.rate_limiter.check_availability(model_name, provider)
+                        if status != ProviderStatus.AVAILABLE:
+                            skipped.add(provider.name)
+                            logger.debug("Provider %s unavailable: %s", provider.name, reason)
+                            continue
 
-                    remaining[provider.name] -= 1
-                    round_attempted = True
+                        provider_format = provider.format
+                        direct_stream = self._is_direct_stream_compatible(client_format, provider_format)
+                        force_non_stream_for_format = is_stream and provider.non_stream_support and not direct_stream
+                        need_convert_stream = is_stream and (not provider.stream_support or force_non_stream_for_format)
+                        need_convert_non_stream = (not is_stream) and (not provider.non_stream_support)
 
-                    result, error_type = self._try_provider_once(
-                        provider=provider,
-                        body=canonical_body,
-                        endpoint=endpoint,
-                        model_name=model_name,
-                        is_stream=is_stream,
-                        need_convert_stream=need_convert_stream,
-                        need_convert_non_stream=need_convert_non_stream,
-                        client_format=client_format,
-                    )
-                    if error_type is None:
-                        return result
+                        remaining[provider.name] -= 1
+                        round_attempted = True
 
-                    last_error = result
-                    if error_type == "client_error":
-                        return result
-                    if error_type == "auth_error":
-                        skipped.add(provider.name)
+                        result, error_type = self._try_provider_once(
+                            provider=provider,
+                            body=canonical_body,
+                            endpoint=endpoint,
+                            model_name=model_name,
+                            is_stream=is_stream,
+                            need_convert_stream=need_convert_stream,
+                            need_convert_non_stream=need_convert_non_stream,
+                            client_format=client_format,
+                        )
+                        if error_type is None:
+                            if self._should_release_worker_on_close(result):
+                                self._register_worker_release_on_close(result, model_name)
+                                release_on_close = True
+                            return result
 
-                if not round_attempted:
-                    break
+                        last_error = result
+                        if error_type == "client_error":
+                            return result
+                        if error_type == "auth_error":
+                            skipped.add(provider.name)
 
-        if last_error:
-            return last_error
-        return self._error_response(502, "No available upstream provider")
+                    if not round_attempted:
+                        break
+
+            if last_error:
+                return last_error
+            return self._error_response_for_client(502, "No available upstream provider", client_format)
+        finally:
+            if not release_on_close:
+                self.provider_manager.release_model_worker(model_name)
 
     def _try_provider_once(
         self,
@@ -183,10 +201,10 @@ class OpenAIProxy:
                 return response, None
             return response, self._classify_error(status_code)
         except httpx.TimeoutException:
-            return self._error_response(504, "Upstream timeout"), "timeout"
+            return self._error_response_for_client(504, "Upstream timeout", client_format), "timeout"
         except Exception as exc:
             logger.exception("Unexpected provider error")
-            return self._error_response(502, f"Upstream error: {exc}"), "server_error"
+            return self._error_response_for_client(502, f"Upstream error: {exc}", client_format), "server_error"
 
     @staticmethod
     def _classify_error(status_code: int) -> str:
@@ -249,7 +267,11 @@ class OpenAIProxy:
                 try:
                     return self._convert_to_stream(response.json(), client_format), 200, tokens
                 except Exception:
-                    return self._error_response(502, "Cannot convert non-JSON response to stream"), 502, 0
+                    return self._error_response_for_client(
+                        502,
+                        "Cannot convert non-JSON response to stream",
+                        client_format,
+                    ), 502, 0
             return Response(response.content, status=response.status_code, content_type="application/json"), response.status_code, tokens
 
         try:
@@ -422,7 +444,7 @@ class OpenAIProxy:
             client_data = self._convert_openai_response_to_client(openai_data, client_format)
             return self._json_response(client_data), 200, usage.get("total_tokens", 0)
         except Exception as exc:
-            return self._error_response(502, f"Stream conversion error: {exc}"), 502, 0
+            return self._error_response_for_client(502, f"Stream conversion error: {exc}", client_format), 502, 0
 
     def _convert_to_stream(self, response_data: dict, client_format: str) -> Response:
         return Response(
@@ -1530,6 +1552,79 @@ class OpenAIProxy:
             or (client_format == CLIENT_FORMAT_CLAUDE and provider_format == PROVIDER_FORMAT_CLAUDE)
             or (client_format == CLIENT_FORMAT_GEMINI and provider_format == PROVIDER_FORMAT_GEMINI)
         )
+
+    @staticmethod
+    def _should_release_worker_on_close(response: Response) -> bool:
+        return bool(getattr(response, "is_streamed", False))
+
+    def _register_worker_release_on_close(self, response: Response, model_name: str):
+        released = False
+
+        def _release_once():
+            nonlocal released
+            if released:
+                return
+            released = True
+            self.provider_manager.release_model_worker(model_name)
+
+        response.call_on_close(_release_once)
+
+    def _error_response_for_client(self, status_code: int, message: str, client_format: str) -> Response:
+        if client_format == CLIENT_FORMAT_CLAUDE:
+            return self._claude_error_response(status_code, message)
+        if client_format == CLIENT_FORMAT_GEMINI:
+            return self._gemini_error_response(status_code, message)
+        return self._error_response(status_code, message)
+
+    @staticmethod
+    def _claude_error_response(status_code: int, message: str) -> Response:
+        if status_code == 429:
+            error_type = "rate_limit_error"
+        elif status_code in (401, 403):
+            error_type = "authentication_error"
+        elif status_code >= 500:
+            error_type = "api_error"
+        else:
+            error_type = "invalid_request_error"
+
+        body = {
+            "type": "error",
+            "error": {
+                "type": error_type,
+                "message": message,
+            },
+        }
+        return Response(json.dumps(body), status=status_code, content_type="application/json")
+
+    @staticmethod
+    def _gemini_error_response(status_code: int, message: str) -> Response:
+        status_text = OpenAIProxy._http_status_to_gemini_status(status_code)
+        body = {
+            "error": {
+                "code": status_code,
+                "message": message,
+                "status": status_text,
+            }
+        }
+        return Response(json.dumps(body), status=status_code, content_type="application/json")
+
+    @staticmethod
+    def _http_status_to_gemini_status(status_code: int) -> str:
+        mapping = {
+            400: "INVALID_ARGUMENT",
+            401: "UNAUTHENTICATED",
+            403: "PERMISSION_DENIED",
+            404: "NOT_FOUND",
+            408: "DEADLINE_EXCEEDED",
+            409: "ABORTED",
+            429: "RESOURCE_EXHAUSTED",
+            500: "INTERNAL",
+            501: "UNIMPLEMENTED",
+            502: "UNAVAILABLE",
+            503: "UNAVAILABLE",
+            504: "DEADLINE_EXCEEDED",
+        }
+        return mapping.get(status_code, "UNKNOWN")
 
     @staticmethod
     def _error_response(status_code: int, message: str) -> Response:

@@ -1,0 +1,111 @@
+{
+  "_global": {
+    "default_timeout": 120,
+    "default_retry": 3,
+    "log_requests": true,
+    "api_key": "replace-with-your-gateway-api-key"
+  },
+  "gpt-4o": {
+    "max_worker": 16,
+    "providers": [
+      {
+        "name": "openai-main",
+        "endpoint": "https://api.openai.com/v1",
+        "api_key": "replace-with-openai-api-key",
+        "model": "gpt-4o",
+        "format": "openai",
+        "priority": 1,
+        "weight": 10,
+        "rate_limit": {
+          "requests_per_period": 1000,
+          "tokens_per_period": 2000000,
+          "period_cron": "0 0 * * *"
+        },
+        "retry": 2,
+        "timeout": 60,
+        "stream_support": true,
+        "non_stream_support": true,
+        "enabled": true,
+        "custom_headers": {
+          "X-Project": "gateway-demo"
+        },
+        "max_context_length": 128000
+      },
+      {
+        "name": "openai-responses-backup",
+        "endpoint": "https://api.openai.com/v1",
+        "api_key": "replace-with-openai-api-key",
+        "model": "gpt-4o",
+        "format": "openai-response",
+        "priority": 2,
+        "weight": 8,
+        "rate_limit": {
+          "requests_per_period": 500,
+          "tokens_per_period": 1000000,
+          "period_cron": "0 0 * * *"
+        },
+        "retry": 2,
+        "timeout": 60,
+        "stream_support": true,
+        "non_stream_support": true,
+        "enabled": true,
+        "custom_headers": null,
+        "max_context_length": 128000
+      }
+    ]
+  },
+  "claude-sonnet": {
+    "max_worker": 8,
+    "providers": [
+      {
+        "name": "anthropic-official",
+        "endpoint": "https://api.anthropic.com/v1",
+        "api_key": "replace-with-anthropic-api-key",
+        "model": "claude-3-5-sonnet-20241022",
+        "format": "claude",
+        "priority": 1,
+        "weight": 10,
+        "rate_limit": {
+          "requests_per_period": 300,
+          "tokens_per_period": 800000,
+          "period_cron": "0 0 * * *"
+        },
+        "retry": 2,
+        "timeout": 90,
+        "stream_support": true,
+        "non_stream_support": true,
+        "enabled": true,
+        "custom_headers": {
+          "anthropic-version": "2023-06-01"
+        },
+        "max_context_length": 200000
+      }
+    ]
+  },
+  "gemini-1.5-pro": {
+    "max_worker": null,
+    "providers": [
+      {
+        "name": "google-ai-studio",
+        "endpoint": "https://generativelanguage.googleapis.com",
+        "api_key": "replace-with-gemini-api-key",
+        "model": "gemini-1.5-pro",
+        "format": "gemini",
+        "priority": 1,
+        "weight": 10,
+        "rate_limit": {
+          "requests_per_period": 600,
+          "tokens_per_period": null,
+          "period_cron": "0 0 * * *"
+        },
+        "retry": 3,
+        "timeout": 60,
+        "stream_support": true,
+        "non_stream_support": true,
+        "enabled": true,
+        "custom_headers": null,
+        "max_context_length": 1048576
+      }
+    ]
+  }
+}

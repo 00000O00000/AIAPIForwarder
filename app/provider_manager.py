@@ -1,89 +1,105 @@
-"""
-提供商管理器 - 负责选择和管理提供商
-"""
+"""Provider selection and runtime model-concurrency management."""
 
-import random
 import logging
-from typing import Optional, List, Dict
+import random
+import threading
+from typing import Dict, List, Optional, Tuple
+
 from .config import ConfigManager, UsageManager
-from .rate_limiter import RateLimiter
 from .models import ProviderConfig, ProviderStatus
+from .rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
 
 
 class ProviderManager:
-    """提供商管理器"""
-    
-    def __init__(self, config_manager: ConfigManager, usage_manager: UsageManager = None):
+    """Manage provider availability checks, selection and usage tracking."""
+
+    def __init__(self, config_manager: ConfigManager, usage_manager: Optional[UsageManager] = None):
         self.config_manager = config_manager
         self.usage_manager = usage_manager or UsageManager()
         self.rate_limiter = RateLimiter(config_manager, self.usage_manager)
-    
+
+        # Runtime in-flight counters for model-level max_worker limit.
+        self._model_running_workers: Dict[str, int] = {}
+        self._model_workers_lock = threading.Lock()
+
     def get_available_models(self) -> List[str]:
-        """获取所有可用模型"""
+        """Return all configured model names."""
         return self.config_manager.get_all_models()
-    
-    def select_provider(self, model_name: str,
-                       exclude_providers: Optional[List[str]] = None,
-                       require_stream: Optional[bool] = None) -> Optional[ProviderConfig]:
-        """
-        选择一个可用的提供商
-        
-        Args:
-            model_name: 模型名称
-            exclude_providers: 排除的提供商列表
-            require_stream: 是否需要流式支持 (True=需要流式, False=需要非流式, None=不限)
-        
-        Returns:
-            选中的提供商配置，如果没有可用的则返回 None
-        """
-        exclude_providers = set(exclude_providers or [])
+
+    def try_acquire_model_worker(self, model_name: str) -> Tuple[bool, str]:
+        """Try to reserve one worker slot for a model."""
+        max_worker = self.config_manager.get_model_max_worker(model_name)
+        if max_worker is None:
+            return True, "No max_worker limit configured"
+
+        with self._model_workers_lock:
+            running = self._model_running_workers.get(model_name, 0)
+            if running >= max_worker:
+                return False, f"Model concurrency limit reached: {running}/{max_worker}"
+            self._model_running_workers[model_name] = running + 1
+            return True, f"Model worker acquired: {running + 1}/{max_worker}"
+
+    def release_model_worker(self, model_name: str):
+        """Release one worker slot for a model."""
+        with self._model_workers_lock:
+            running = self._model_running_workers.get(model_name, 0)
+            if running <= 0:
+                logger.debug("Model worker release ignored for %s: no running workers", model_name)
+                return
+            if running == 1:
+                self._model_running_workers.pop(model_name, None)
+                return
+            self._model_running_workers[model_name] = running - 1
+
+    def get_model_running_workers(self, model_name: str) -> int:
+        """Return current in-flight request count for a model."""
+        with self._model_workers_lock:
+            return self._model_running_workers.get(model_name, 0)
+
+    def select_provider(
+        self,
+        model_name: str,
+        exclude_providers: Optional[List[str]] = None,
+        require_stream: Optional[bool] = None,
+    ) -> Optional[ProviderConfig]:
+        """Select one available provider by priority and weight."""
+        exclude = set(exclude_providers or [])
         providers = self.config_manager.get_providers(model_name)
-        
+
         if not providers:
-            logger.warning(f"No providers configured for model: {model_name}")
+            logger.warning("No providers configured for model: %s", model_name)
             return None
-        
-        # 按优先级分组
-        priority_groups: dict = {}
+
+        priority_groups: Dict[int, List[ProviderConfig]] = {}
         for provider in providers:
-            if provider.name in exclude_providers:
+            if provider.name in exclude:
                 continue
-            
-            # 检查流式支持
+
             if require_stream is True and not provider.stream_support:
                 continue
             if require_stream is False and not provider.non_stream_support:
                 continue
-            
-            # 检查可用性
+
             status, reason = self.rate_limiter.check_availability(model_name, provider)
             if status != ProviderStatus.AVAILABLE:
-                logger.debug(f"Provider {provider.name} unavailable: {reason}")
+                logger.debug("Provider %s unavailable: %s", provider.name, reason)
                 continue
-            
-            priority = provider.priority
-            if priority not in priority_groups:
-                priority_groups[priority] = []
-            priority_groups[priority].append(provider)
-        
+
+            priority_groups.setdefault(provider.priority, []).append(provider)
+
         if not priority_groups:
-            logger.warning(f"No available providers for model: {model_name}")
+            logger.warning("No available providers for model: %s", model_name)
             return None
-        
-        # 选择优先级最高的组（数字最小）
+
         best_priority = min(priority_groups.keys())
-        candidates = priority_groups[best_priority]
-        
-        # 在同优先级中按权重随机选择
-        selected = self._weighted_random_choice(candidates)
-        logger.info(f"Selected provider {selected.name} for model {model_name}")
-        
+        selected = self._weighted_random_choice(priority_groups[best_priority])
+        logger.info("Selected provider %s for model %s", selected.name, model_name)
         return selected
-    
+
     def _weighted_random_choice(self, providers: List[ProviderConfig]) -> ProviderConfig:
-        """根据权重随机选择"""
+        """Return one provider selected by configured weight."""
         if not providers:
             raise ValueError("providers must not be empty")
         if len(providers) == 1:
@@ -95,39 +111,30 @@ class ProviderManager:
             return random.choice(providers)
 
         return random.choices(providers, weights=weights, k=1)[0]
-    
-    def get_provider_by_name(self, model_name: str, 
-                             provider_name: str) -> Optional[ProviderConfig]:
-        """根据名称获取提供商"""
-        providers = self.config_manager.get_providers(model_name)
-        for p in providers:
-            if p.name == provider_name:
-                return p
+
+    def get_provider_by_name(self, model_name: str, provider_name: str) -> Optional[ProviderConfig]:
+        """Return provider config by provider name."""
+        for provider in self.config_manager.get_providers(model_name):
+            if provider.name == provider_name:
+                return provider
         return None
-    
+
     def record_success(self, model_name: str, provider_name: str, tokens: int = 0):
-        """记录成功请求"""
-        self.rate_limiter.record_usage(model_name, provider_name, 
-                                       requests=1, tokens=tokens)
-    
+        """Record one successful request."""
+        self.rate_limiter.record_usage(model_name, provider_name, requests=1, tokens=tokens)
+
     def record_stream_tokens(self, model_name: str, provider_name: str, tokens: int):
-        """记录流式请求结束后的 token 使用量（不增加请求数）"""
-        self.rate_limiter.record_usage(model_name, provider_name,
-                                       requests=0, tokens=tokens)
-    
+        """Record stream-token usage without incrementing request count."""
+        self.rate_limiter.record_usage(model_name, provider_name, requests=0, tokens=tokens)
+
     def get_providers_by_priority(self, model_name: str) -> Dict[int, List[ProviderConfig]]:
-        """
-        获取按优先级分组的提供商列表
-        
-        Returns:
-            {priority: [provider_configs]} 字典
-        """
+        """Return enabled providers grouped by priority, sorted by weight desc."""
         providers = self.config_manager.get_providers(model_name)
         groups: Dict[int, List[ProviderConfig]] = {}
-        for p in providers:
-            if p.priority not in groups:
-                groups[p.priority] = []
-            groups[p.priority].append(p)
+        for provider in providers:
+            groups.setdefault(provider.priority, []).append(provider)
+
         for priority in groups:
             groups[priority].sort(key=lambda item: item.weight, reverse=True)
+
         return groups

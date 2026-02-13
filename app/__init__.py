@@ -1,5 +1,3 @@
-"""
-AI API Gateway - 智能API中转系统
-"""
+"""AI API Gateway package."""
 
 __version__ = "1.0.0"

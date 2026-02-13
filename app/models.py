@@ -43,6 +43,7 @@ class ProviderConfig(BaseModel):
 
 
 class ModelConfig(BaseModel):
+    max_worker: Optional[int] = Field(default=None, ge=1)
     providers: List[ProviderConfig]
 
 

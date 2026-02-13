@@ -1,6 +1,4 @@
-"""
-工具函数
-"""
+"""General helper utilities."""
 
 import hashlib
 import uuid
@@ -8,23 +6,19 @@ from typing import Any, List, Mapping
 
 
 def generate_request_id() -> str:
-    """生成请求ID"""
+    """Generate a short unique request id."""
     return hashlib.md5(uuid.uuid4().bytes).hexdigest()[:16]
 
 
 def estimate_tokens(text: str) -> int:
-    """
-    估算文本的 token 数量
-    简单估算：英文约 4 字符一个 token，中文约 1.5 字符一个 token
-    """
-    # 简单实现：每4个字符算一个token
+    """Rough token estimate using 4 chars ~= 1 token."""
     if not text:
         return 0
     return max(1, len(text) // 4)
 
 
 def estimate_messages_tokens(messages: List[Mapping[str, Any]]) -> int:
-    """估算消息列表的 token 数量"""
+    """Estimate total tokens for message list content fields."""
     total = 0
     for msg in messages:
         content = msg.get("content", "")
@@ -37,8 +31,8 @@ def estimate_messages_tokens(messages: List[Mapping[str, Any]]) -> int:
     return total
 
 
-def safe_int(value, default: int = 0) -> int:
-    """安全转换为整数"""
+def safe_int(value: Any, default: int = 0) -> int:
+    """Safely parse int with fallback."""
     try:
         return int(value)
     except (ValueError, TypeError):
