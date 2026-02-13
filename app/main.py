@@ -11,6 +11,7 @@ from .config import ConfigManager, UsageManager
 from .provider_manager import ProviderManager
 from .proxy import OpenAIProxy
 from .scheduler import UsageResetScheduler
+from .utils import estimate_claude_request_tokens
 
 
 handlers = [logging.StreamHandler()]
@@ -132,6 +133,19 @@ def chat_completions():
 @require_api_key
 def claude_messages():
     return proxy.handle_claude_messages(request)
+
+
+@app.route("/v1/messages/count_tokens", methods=["POST"])
+@require_api_key
+def claude_count_tokens():
+    try:
+        body = request.get_json()
+    except Exception:
+        return jsonify({"error": {"message": "无效的 JSON 请求体", "type": "invalid_request_error"}}), 400
+    if not body or not isinstance(body, dict):
+        return jsonify({"error": {"message": "请求体必须是 JSON 对象", "type": "invalid_request_error"}}), 400
+    token_count = estimate_claude_request_tokens(body)
+    return jsonify({"input_tokens": token_count})
 
 
 @app.route("/v1beta/models/<path:model_action>", methods=["POST"])
