@@ -2,8 +2,9 @@
 Data model definitions.
 """
 
+import math
 from enum import Enum
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -11,7 +12,16 @@ from pydantic import BaseModel, Field, field_validator
 class RateLimitConfig(BaseModel):
     requests_per_period: Optional[int] = Field(default=None, ge=0)
     tokens_per_period: Optional[int] = Field(default=None, ge=0)
+    max_worker: Optional[int] = Field(default=None, ge=1)
     period_cron: str = "0 0 * * *"
+
+    @field_validator("period_cron", mode="before")
+    @classmethod
+    def _normalize_period_cron(cls, value: str) -> str:
+        if value is None:
+            return "0 0 * * *"
+        text = str(value).strip()
+        return text or "0 0 * * *"
 
 
 class ProviderConfig(BaseModel):
@@ -43,15 +53,30 @@ class ProviderConfig(BaseModel):
 
 
 class ModelConfig(BaseModel):
-    max_worker: Optional[int] = Field(default=None, ge=1)
     providers: List[ProviderConfig]
 
 
 class GlobalConfig(BaseModel):
     default_timeout: int = Field(default=120, gt=0)
     default_retry: int = Field(default=3, ge=0)
+    queue_overflow_factor: float = 2.0
     log_requests: bool = True
     api_key: Optional[str] = None
+
+    @field_validator("queue_overflow_factor", mode="before")
+    @classmethod
+    def _normalize_queue_overflow_factor(cls, value: Any) -> float:
+        if value is None:
+            return 2.0
+        try:
+            factor = float(value)
+        except (TypeError, ValueError):
+            return 2.0
+        if not math.isfinite(factor):
+            return 2.0
+        if factor < 1.0:
+            return 1.0
+        return factor
 
 
 class UsageData(BaseModel):

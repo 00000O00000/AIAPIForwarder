@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 from typing import Any, Dict, List, Optional
 
 from filelock import FileLock
@@ -71,6 +72,12 @@ class ConfigManager:
                 if not isinstance(model_data, dict):
                     logger.warning("Skip invalid model config '%s': model config must be an object", model_name)
                     continue
+                if "max_worker" in model_data:
+                    logger.warning(
+                        "Model-level max_worker in '%s' is ignored. "
+                        "Please set rate_limit.max_worker on each provider.",
+                        model_name,
+                    )
 
                 providers_raw = model_data.get("providers", [])
                 if not isinstance(providers_raw, list):
@@ -98,10 +105,7 @@ class ConfigManager:
                         )
                         continue
 
-                self._models[model_name] = ModelConfig(
-                    max_worker=model_data.get("max_worker"),
-                    providers=providers,
-                )
+                self._models[model_name] = ModelConfig(providers=providers)
 
             logger.info("Loaded configuration for %s models", len(self._models))
 
@@ -121,13 +125,6 @@ class ConfigManager:
     def get_model_config(self, model_name: str) -> Optional[ModelConfig]:
         """Get model configuration by model name."""
         return self._models.get(model_name)
-
-    def get_model_max_worker(self, model_name: str) -> Optional[int]:
-        """Get model-level max concurrent workers."""
-        model_config = self._models.get(model_name)
-        if not model_config:
-            return None
-        return model_config.max_worker
 
     def get_all_models(self) -> List[str]:
         """Return all configured model names."""
@@ -160,6 +157,22 @@ class UsageManager:
         raw_name = f"{model_name}_{provider_name}"
         safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw_name)
         return os.path.join(self.data_dir, f"{safe_name}.json")
+
+    @staticmethod
+    def _atomic_write_json(path: str, data: Dict[str, Any]):
+        """Atomically write json file to avoid partial-write corruption."""
+        directory = os.path.dirname(path) or "."
+        fd, tmp_path = tempfile.mkstemp(prefix=".tmp_usage_", suffix=".json", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
     def get_usage(self, model_name: str, provider_name: str) -> UsageData:
         """Read usage counters from disk."""
@@ -196,8 +209,7 @@ class UsageManager:
                 usage.requests = max(0, usage.requests + requests_delta)
                 usage.tokens = max(0, usage.tokens + tokens_delta)
 
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(usage.model_dump(), f)
+                self._atomic_write_json(path, usage.model_dump())
         except Exception as exc:
             logger.error("Failed to update usage: %s", exc)
 
@@ -215,8 +227,7 @@ class UsageManager:
                     tokens=0,
                     last_reset=datetime.now().isoformat(),
                 )
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(usage.model_dump(), f)
+                self._atomic_write_json(path, usage.model_dump())
 
             logger.info("Reset usage for %s/%s", model_name, provider_name)
         except Exception as exc:

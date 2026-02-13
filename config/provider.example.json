@@ -2,11 +2,11 @@
   "_global": {
     "default_timeout": 120,
     "default_retry": 3,
+    "queue_overflow_factor": 2.0,
     "log_requests": true,
     "api_key": "replace-with-your-gateway-api-key"
   },
   "gpt-4o": {
-    "max_worker": 16,
     "providers": [
       {
         "name": "openai-main",
@@ -19,6 +19,7 @@
         "rate_limit": {
           "requests_per_period": 1000,
           "tokens_per_period": 2000000,
+          "max_worker": 1,
           "period_cron": "0 0 * * *"
         },
         "retry": 2,
@@ -42,6 +43,7 @@
         "rate_limit": {
           "requests_per_period": 500,
           "tokens_per_period": 1000000,
+          "max_worker": 2,
           "period_cron": "0 0 * * *"
         },
         "retry": 2,
@@ -55,7 +57,6 @@
     ]
   },
   "claude-sonnet": {
-    "max_worker": 8,
     "providers": [
       {
         "name": "anthropic-official",
@@ -68,6 +69,7 @@
         "rate_limit": {
           "requests_per_period": 300,
           "tokens_per_period": 800000,
+          "max_worker": 1,
           "period_cron": "0 0 * * *"
         },
         "retry": 2,
@@ -83,7 +85,6 @@
     ]
   },
   "gemini-1.5-pro": {
-    "max_worker": null,
     "providers": [
       {
         "name": "google-ai-studio",
@@ -96,6 +97,7 @@
         "rate_limit": {
           "requests_per_period": 600,
           "tokens_per_period": null,
+          "max_worker": null,
           "period_cron": "0 0 * * *"
         },
         "retry": 3,
@@ -105,6 +107,32 @@
         "enabled": true,
         "custom_headers": null,
         "max_context_length": 1048576
+      }
+    ]
+  },
+  "glm-4.7-flash": {
+    "providers": [
+      {
+        "name": "zhipu-official-free-key-1",
+        "endpoint": "https://open.bigmodel.cn/api/paas/v4",
+        "api_key": "replace-with-zhipu-api-key",
+        "model": "glm-4.7-flash",
+        "format": "openai",
+        "priority": 1,
+        "weight": 10,
+        "rate_limit": {
+          "requests_per_period": null,
+          "tokens_per_period": null,
+          "max_worker": 1,
+          "period_cron": "0 0 * * *"
+        },
+        "retry": 2,
+        "timeout": 60,
+        "stream_support": true,
+        "non_stream_support": true,
+        "enabled": true,
+        "custom_headers": null,
+        "max_context_length": null
       }
     ]
   }

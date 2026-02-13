@@ -1,7 +1,7 @@
 """Provider-level rate limit checks and usage accounting."""
 
 import logging
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from .config import ConfigManager, UsageManager
 from .models import ProviderConfig, ProviderStatus
@@ -70,7 +70,7 @@ class RateLimiter:
             safe_tokens,
         )
 
-    def get_usage_stats(self, model_name: str, provider_name: str) -> Dict[str, Optional[int]]:
+    def get_usage_stats(self, model_name: str, provider_name: str) -> Dict[str, Any]:
         """Return usage and configured limits for one provider."""
         usage = self.usage_manager.get_usage(model_name, provider_name)
         provider = next((p for p in self.config_manager.get_providers(model_name) if p.name == provider_name), None)
@@ -81,6 +81,7 @@ class RateLimiter:
                 "tokens": usage.tokens,
                 "requests_limit": None,
                 "tokens_limit": None,
+                "max_worker_limit": None,
             }
 
         return {
@@ -88,5 +89,6 @@ class RateLimiter:
             "tokens": usage.tokens,
             "requests_limit": provider.rate_limit.requests_per_period,
             "tokens_limit": provider.rate_limit.tokens_per_period,
+            "max_worker_limit": provider.rate_limit.max_worker,
             "last_reset": usage.last_reset,
         }

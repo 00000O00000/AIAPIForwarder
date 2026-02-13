@@ -2,6 +2,7 @@
 
 import logging
 import os
+import hmac
 from functools import wraps
 
 from flask import Flask, jsonify, request
@@ -77,7 +78,7 @@ def require_api_key(func):
                     401,
                 )
 
-            if provided_key != gateway_api_key:
+            if not hmac.compare_digest(provided_key, gateway_api_key):
                 return (
                     jsonify(
                         {
@@ -171,6 +172,7 @@ def get_stats():
                 "last_reset": usage.last_reset,
                 "limit_requests": provider.rate_limit.requests_per_period if provider.rate_limit else None,
                 "limit_tokens": provider.rate_limit.tokens_per_period if provider.rate_limit else None,
+                "limit_max_worker": provider.rate_limit.max_worker if provider.rate_limit else None,
             }
     return jsonify(stats)
 
@@ -192,13 +194,28 @@ def get_model_providers(model_name: str):
     providers = config_manager.get_providers(model_name)
     if not providers:
         return jsonify({"error": "Model not found"}), 404
+    queue_overflow_factor = config_manager.global_config.queue_overflow_factor
+    priority_groups = {}
+    for provider in providers:
+        priority_groups.setdefault(provider.priority, []).append(provider)
 
-    max_worker = config_manager.get_model_max_worker(model_name)
-    running_workers = provider_manager.get_model_running_workers(model_name)
+    priority_queue_limits = {
+        priority: provider_manager.get_priority_queue_limit(group, queue_overflow_factor)
+        for priority, group in priority_groups.items()
+    }
+    priority_waiting_workers = {
+        priority: provider_manager.get_priority_waiting_workers(model_name, priority)
+        for priority in priority_groups
+    }
 
     result = []
     for provider in providers:
         status, reason = provider_manager.rate_limiter.check_availability(model_name, provider)
+        provider_max_worker = provider.rate_limit.max_worker if provider.rate_limit else None
+        provider_running_workers = provider_manager.get_provider_running_workers(model_name, provider.name)
+        provider_worker_available = (
+            provider_max_worker is None or provider_running_workers < provider_max_worker
+        )
         result.append(
             {
                 "name": provider.name,
@@ -209,8 +226,12 @@ def get_model_providers(model_name: str):
                 "status_reason": reason,
                 "stream_support": provider.stream_support,
                 "non_stream_support": provider.non_stream_support,
-                "model_max_worker": max_worker,
-                "model_running_workers": running_workers,
+                "provider_max_worker": provider_max_worker,
+                "provider_running_workers": provider_running_workers,
+                "provider_worker_available": provider_worker_available,
+                "priority_queue_overflow_factor": queue_overflow_factor,
+                "priority_queue_limit": priority_queue_limits.get(provider.priority),
+                "priority_waiting_workers": priority_waiting_workers.get(provider.priority, 0),
             }
         )
 

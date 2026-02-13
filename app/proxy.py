@@ -2,8 +2,10 @@
 
 import json
 import logging
+import random
+import threading
 import time
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 import httpx
@@ -92,40 +94,48 @@ class OpenAIProxy:
         if not model_name:
             return self._error_response_for_client(400, "Model field is required", client_format)
 
-        acquired, acquire_reason = self.provider_manager.try_acquire_model_worker(model_name)
-        if not acquired:
-            logger.info("Skip model %s due to max_worker limit: %s", model_name, acquire_reason)
-            return self._error_response_for_client(429, acquire_reason, client_format)
+        is_stream = bool(canonical_body.get("stream", False))
+        priority_groups = self.provider_manager.get_providers_by_priority(model_name)
+        if not priority_groups:
+            return self._error_response_for_client(
+                502,
+                f"No available upstream providers for model: {model_name}",
+                client_format,
+            )
 
-        release_on_close = False
-        try:
-            is_stream = bool(canonical_body.get("stream", False))
-            priority_groups = self.provider_manager.get_providers_by_priority(model_name)
-            if not priority_groups:
-                return self._error_response_for_client(
-                    502,
-                    f"No available upstream providers for model: {model_name}",
-                    client_format,
-                )
+        last_error = None
+        concurrency_limited = False
+        queue_overflow_factor = self.provider_manager.config_manager.global_config.queue_overflow_factor
+        for priority in sorted(priority_groups.keys()):
+            providers = priority_groups[priority]
+            remaining = {p.name: p.retry + 1 for p in providers}
+            skipped = set()
 
-            last_error = None
-            for priority in sorted(priority_groups.keys()):
-                providers = priority_groups[priority]
-                remaining = {p.name: p.retry + 1 for p in providers}
-                skipped = set()
+            while True:
+                round_attempted = False
+                blocked_by_provider_max_worker = False
+                # #1: 按 weight 加权打乱 provider 顺序，让权重高的更可能排在前面
+                shuffled = self._weighted_shuffle(providers)
+                for provider in shuffled:
+                    if provider.name in skipped or remaining[provider.name] <= 0:
+                        continue
 
-                while True:
-                    round_attempted = False
-                    for provider in providers:
-                        if provider.name in skipped or remaining[provider.name] <= 0:
-                            continue
-
-                        status, reason = self.provider_manager.rate_limiter.check_availability(model_name, provider)
-                        if status != ProviderStatus.AVAILABLE:
+                    # #2: 原子地完成 rate_limit 检查 + worker 获取
+                    acquired, acquire_reason, fail_type = (
+                        self.provider_manager.check_and_acquire_provider_worker(model_name, provider)
+                    )
+                    if not acquired:
+                        if fail_type == "rate_limited":
                             skipped.add(provider.name)
-                            logger.debug("Provider %s unavailable: %s", provider.name, reason)
-                            continue
+                            logger.debug("Provider %s unavailable: %s", provider.name, acquire_reason)
+                        elif fail_type == "max_worker":
+                            concurrency_limited = True
+                            blocked_by_provider_max_worker = True
+                            logger.debug("Provider %s skipped by max_worker: %s", provider.name, acquire_reason)
+                        continue
 
+                    provider_release_on_close = False
+                    try:
                         provider_format = provider.format
                         direct_stream = self._is_direct_stream_compatible(client_format, provider_format)
                         force_non_stream_for_format = is_stream and provider.non_stream_support and not direct_stream
@@ -146,9 +156,13 @@ class OpenAIProxy:
                             client_format=client_format,
                         )
                         if error_type is None:
-                            if self._should_release_worker_on_close(result):
-                                self._register_worker_release_on_close(result, model_name)
-                                release_on_close = True
+                            if self._should_hold_provider_worker_until_close(result):
+                                self._register_provider_worker_release_on_close(
+                                    response=result,
+                                    release_callback=lambda m=model_name, p=provider.name: self.provider_manager.release_provider_worker(m, p),
+                                    safety_timeout=provider.timeout * 3,
+                                )
+                                provider_release_on_close = True
                             return result
 
                         last_error = result
@@ -156,16 +170,41 @@ class OpenAIProxy:
                             return result
                         if error_type == "auth_error":
                             skipped.add(provider.name)
+                    finally:
+                        if not provider_release_on_close:
+                            self.provider_manager.release_provider_worker(model_name, provider.name)
 
-                    if not round_attempted:
-                        break
+                if not round_attempted:
+                    if blocked_by_provider_max_worker:
+                        wait_timeout = self._get_priority_queue_wait_timeout(providers)
+                        queued, queue_reason = self.provider_manager.wait_for_priority_capacity(
+                            model_name=model_name,
+                            priority=priority,
+                            providers=providers,
+                            wait_timeout=wait_timeout,
+                            queue_overflow_factor=queue_overflow_factor,
+                        )
+                        if queued:
+                            logger.debug(
+                                "Priority %s queue wakeup for model %s: %s",
+                                priority,
+                                model_name,
+                                queue_reason,
+                            )
+                            continue
+                        logger.debug(
+                            "Priority %s queue bypass for model %s: %s",
+                            priority,
+                            model_name,
+                            queue_reason,
+                        )
+                    break
 
-            if last_error:
-                return last_error
-            return self._error_response_for_client(502, "No available upstream provider", client_format)
-        finally:
-            if not release_on_close:
-                self.provider_manager.release_model_worker(model_name)
+        if last_error:
+            return last_error
+        if concurrency_limited:
+            return self._error_response_for_client(429, "All available providers are busy", client_format)
+        return self._error_response_for_client(502, "No available upstream provider", client_format)
 
     def _try_provider_once(
         self,
@@ -373,6 +412,7 @@ class OpenAIProxy:
                 content_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
             )
+            setattr(response, "_hold_provider_worker_until_close", True)
             return response, 200, 0
         except Exception:
             client.close()
@@ -1554,20 +1594,30 @@ class OpenAIProxy:
         )
 
     @staticmethod
-    def _should_release_worker_on_close(response: Response) -> bool:
-        return bool(getattr(response, "is_streamed", False))
+    def _should_hold_provider_worker_until_close(response: Response) -> bool:
+        return bool(getattr(response, "_hold_provider_worker_until_close", False))
 
-    def _register_worker_release_on_close(self, response: Response, model_name: str):
-        released = False
+    def _register_provider_worker_release_on_close(
+        self, response: Response, release_callback: Callable[[], None], safety_timeout: float = 180.0,
+    ):
+        released = threading.Event()
 
         def _release_once():
-            nonlocal released
-            if released:
+            if released.is_set():
                 return
-            released = True
-            self.provider_manager.release_model_worker(model_name)
+            released.set()
+            release_callback()
 
         response.call_on_close(_release_once)
+
+        # #5: 安全超时兜底——防止客户端异常断开导致 worker 永久泄漏
+        def _safety_release():
+            if not released.wait(timeout=max(60.0, safety_timeout)):
+                logger.warning("流式 worker 安全超时释放触发（%.0fs），可能客户端连接异常", safety_timeout)
+                _release_once()
+
+        timer = threading.Thread(target=_safety_release, daemon=True)
+        timer.start()
 
     def _error_response_for_client(self, status_code: int, message: str, client_format: str) -> Response:
         if client_format == CLIENT_FORMAT_CLAUDE:
@@ -1654,3 +1704,29 @@ class OpenAIProxy:
                 return stops[0]
             return stops
         return None
+
+    @staticmethod
+    def _get_priority_queue_wait_timeout(providers: List[ProviderConfig]) -> float:
+        """Wait timeout for a priority queue fallback cycle."""
+        # #6: 使用 min(timeout) 避免单个高 timeout provider 导致排队等待过长
+        timeouts = [float(p.timeout) for p in providers if getattr(p, "timeout", None)]
+        if not timeouts:
+            return 60.0
+        return max(1.0, min(timeouts))
+
+    @staticmethod
+    def _weighted_shuffle(providers: List[ProviderConfig]) -> List[ProviderConfig]:
+        """
+        按 weight 加权打乱 provider 列表顺序。
+        权重越高的 provider 越可能排在前面。
+        """
+        if len(providers) <= 1:
+            return providers
+        weights = [max(1, p.weight) for p in providers]
+        result = []
+        candidates = list(zip(providers, weights))
+        while candidates:
+            selected = random.choices(range(len(candidates)), weights=[w for _, w in candidates], k=1)[0]
+            result.append(candidates[selected][0])
+            candidates.pop(selected)
+        return result
