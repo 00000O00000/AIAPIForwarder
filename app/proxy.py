@@ -1,511 +1,1556 @@
-"""
-代理转发模块 - 处理请求转发和响应处理
-"""
+"""Request proxy module."""
 
 import json
 import logging
+import time
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
+
 import httpx
-from typing import Optional, Tuple, Any
 from flask import Request, Response, stream_with_context
 
-from .provider_manager import ProviderManager
 from .models import ProviderConfig, ProviderStatus
+from .provider_manager import ProviderManager
 
 logger = logging.getLogger(__name__)
 
+CLIENT_FORMAT_OPENAI = "openai"
+CLIENT_FORMAT_CLAUDE = "claude"
+CLIENT_FORMAT_GEMINI = "gemini"
+
+PROVIDER_FORMAT_OPENAI = "openai"
+PROVIDER_FORMAT_OPENAI_RESPONSE = "openai-response"
+PROVIDER_FORMAT_CLAUDE = "claude"
+PROVIDER_FORMAT_GEMINI = "gemini"
+
 
 class OpenAIProxy:
-    """OpenAI API 代理"""
-    
     def __init__(self, provider_manager: ProviderManager):
         self.provider_manager = provider_manager
-    
+
     def handle_chat_completion(self, request: Request) -> Response:
-        """处理 chat completion 请求"""
         return self._proxy_request(request, "/chat/completions")
-    
+
     def handle_completion(self, request: Request) -> Response:
-        """处理 completion 请求"""
-        return self._proxy_request(request, "/completions")
-    
+        return self._proxy_request(request, "/completions", forced_client_format=CLIENT_FORMAT_OPENAI)
+
     def handle_embeddings(self, request: Request) -> Response:
-        """处理 embeddings 请求"""
-        return self._proxy_request(request, "/embeddings")
-    
-    def _proxy_request(self, request: Request, endpoint: str) -> Response:
-        """
-        通用代理请求处理
-        
-        故障转移逻辑：
-        1. 按优先级分组，先尝试高优先级组（数字越小优先级越高）
-        2. 组内轮询：所有 provider 各尝试一次为一轮，循环多轮直到重试次数耗尽
-        3. 当前优先级组全部失败后，切换到下一优先级组
-        4. 所有 provider 均失败时返回 502
-        """
+        return self._proxy_request(request, "/embeddings", forced_client_format=CLIENT_FORMAT_OPENAI)
+
+    def handle_claude_messages(self, request: Request) -> Response:
+        return self._proxy_request(request, "/chat/completions", forced_client_format=CLIENT_FORMAT_CLAUDE)
+
+    def handle_gemini_content(self, request: Request, model_action: str) -> Response:
+        route_model, route_stream = self._parse_gemini_model_action(model_action)
+        return self._proxy_request(
+            request,
+            "/chat/completions",
+            forced_client_format=CLIENT_FORMAT_GEMINI,
+            route_model=route_model,
+            route_stream=route_stream,
+        )
+
+    @staticmethod
+    def _parse_gemini_model_action(model_action: str) -> Tuple[str, bool]:
+        model = model_action
+        stream = False
+        if ":" in model_action:
+            model, action = model_action.split(":", 1)
+            stream = action == "streamGenerateContent"
+        return model, stream
+
+    def _proxy_request(
+        self,
+        request: Request,
+        endpoint: str,
+        forced_client_format: Optional[str] = None,
+        route_model: Optional[str] = None,
+        route_stream: Optional[bool] = None,
+    ) -> Response:
         try:
             body = request.get_json()
-        except Exception as e:
-            return self._error_response(400, f"Invalid JSON body: {e}")
-        
+        except Exception as exc:
+            return self._error_response(400, f"Invalid JSON body: {exc}")
+
         if not body:
             return self._error_response(400, "Request body is required")
-        
         if not isinstance(body, dict):
             return self._error_response(400, "Request body must be a JSON object")
-        
-        body = self._normalize_request_body(body)
-        
-        model_name = body.get("model")
+
+        client_format = forced_client_format or self._detect_client_format(body, endpoint)
+        canonical_body = self._convert_client_request_to_openai(
+            body=body,
+            endpoint=endpoint,
+            client_format=client_format,
+            route_model=route_model,
+            route_stream=route_stream,
+        )
+        canonical_body = self._normalize_request_body(canonical_body)
+
+        model_name = canonical_body.get("model")
         if not model_name:
             return self._error_response(400, "Model field is required")
-        
-        is_stream = body.get("stream", False)
-        
-        # 按优先级获取所有提供商
+
+        is_stream = bool(canonical_body.get("stream", False))
         priority_groups = self.provider_manager.get_providers_by_priority(model_name)
-        
         if not priority_groups:
-            return self._error_response(
-                502, f"No available upstream providers for model: {model_name}"
-            )
-        
+            return self._error_response(502, f"No available upstream providers for model: {model_name}")
+
         last_error = None
-        
-        # 按优先级从高到低遍历（数字越小优先级越高）
         for priority in sorted(priority_groups.keys()):
             providers = priority_groups[priority]
-            
-            # 每个 provider 的剩余尝试次数（1次初始 + retry次重试）
             remaining = {p.name: p.retry + 1 for p in providers}
-            # 已永久跳过的 provider（认证/限流等不可恢复错误）
             skipped = set()
-            
-            # 轮询直到所有 provider 的尝试次数耗尽
+
             while True:
                 round_attempted = False
-                
                 for provider in providers:
-                    if provider.name in skipped:
+                    if provider.name in skipped or remaining[provider.name] <= 0:
                         continue
-                    if remaining[provider.name] <= 0:
-                        continue
-                    
-                    # 检查限额可用性
-                    status, reason = self.provider_manager.rate_limiter.check_availability(
-                        model_name, provider
-                    )
+
+                    status, reason = self.provider_manager.rate_limiter.check_availability(model_name, provider)
                     if status != ProviderStatus.AVAILABLE:
                         skipped.add(provider.name)
-                        logger.debug(f"Provider {provider.name} unavailable: {reason}")
+                        logger.debug("Provider %s unavailable: %s", provider.name, reason)
                         continue
-                    
+
+                    provider_format = provider.format
+                    direct_stream = self._is_direct_stream_compatible(client_format, provider_format)
+                    force_non_stream_for_format = is_stream and provider.non_stream_support and not direct_stream
+                    need_convert_stream = is_stream and (not provider.stream_support or force_non_stream_for_format)
+                    need_convert_non_stream = (not is_stream) and (not provider.non_stream_support)
+
                     remaining[provider.name] -= 1
                     round_attempted = True
-                    
-                    logger.info(
-                        f"Trying provider {provider.name} "
-                        f"(priority={priority}, remaining={remaining[provider.name]})"
-                    )
-                    
-                    # 确定流式转换需求
-                    need_convert_stream = is_stream and not provider.stream_support
-                    need_convert_non_stream = not is_stream and not provider.non_stream_support
-                    
-                    # 尝试一次请求
+
                     result, error_type = self._try_provider_once(
-                        provider, body, endpoint, model_name,
-                        is_stream, need_convert_stream, need_convert_non_stream
+                        provider=provider,
+                        body=canonical_body,
+                        endpoint=endpoint,
+                        model_name=model_name,
+                        is_stream=is_stream,
+                        need_convert_stream=need_convert_stream,
+                        need_convert_non_stream=need_convert_non_stream,
+                        client_format=client_format,
                     )
-                    
                     if error_type is None:
                         return result
-                    
+
                     last_error = result
-                    
                     if error_type == "client_error":
-                        # 400 客户端请求错误，任何 provider 都无法处理
                         return result
-                    elif error_type == "auth_error":
-                        # 认证/限流错误，跳过此 provider 不再重试
+                    if error_type == "auth_error":
                         skipped.add(provider.name)
-                        logger.warning(
-                            f"Provider {provider.name} skipped: {error_type}"
-                        )
-                    else:
-                        # server_error / timeout → 继续轮询下一个 provider
-                        logger.warning(
-                            f"Provider {provider.name} failed ({error_type}), trying next"
-                        )
-                
+
                 if not round_attempted:
                     break
-            
-            logger.info(f"Priority group {priority} exhausted, trying next group")
-        
-        # 所有 provider 都失败
+
         if last_error:
             return last_error
-        return self._error_response(502, "当前暂无可用上游供应商")
-    
+        return self._error_response(502, "No available upstream provider")
+
     def _try_provider_once(
-        self, provider: ProviderConfig, body: dict,
-        endpoint: str, model_name: str,
-        is_stream: bool, need_convert_stream: bool,
-        need_convert_non_stream: bool
+        self,
+        provider: ProviderConfig,
+        body: dict,
+        endpoint: str,
+        model_name: str,
+        is_stream: bool,
+        need_convert_stream: bool,
+        need_convert_non_stream: bool,
+        client_format: str,
     ) -> Tuple[Response, Optional[str]]:
-        """
-        尝试使用指定提供商发送一次请求
-        
-        Returns:
-            (response, error_type)
-            error_type: None=成功, "client_error", "auth_error", "server_error", "timeout"
-        """
         upstream_body = body.copy()
         upstream_body["model"] = provider.model
-        
         if need_convert_stream:
             upstream_body["stream"] = False
         elif need_convert_non_stream:
             upstream_body["stream"] = True
-        
+
         try:
             response, status_code, tokens = self._send_request(
-                provider, upstream_body, endpoint,
-                is_stream and not need_convert_stream,
-                need_convert_stream, need_convert_non_stream,
-                model_name
+                provider=provider,
+                body=upstream_body,
+                endpoint=endpoint,
+                is_stream=is_stream and not need_convert_stream,
+                need_convert_stream=need_convert_stream,
+                need_convert_non_stream=need_convert_non_stream,
+                model_name=model_name,
+                client_format=client_format,
             )
-            
             if 200 <= status_code < 300:
                 self.provider_manager.record_success(model_name, provider.name, tokens)
                 return response, None
-            
-            error_type = self._classify_error(status_code)
-            logger.warning(
-                f"Provider {provider.name} returned {status_code}, "
-                f"error_type={error_type}"
-            )
-            return response, error_type
-            
+            return response, self._classify_error(status_code)
         except httpx.TimeoutException:
-            logger.error(f"Timeout when calling {provider.name}")
             return self._error_response(504, "Upstream timeout"), "timeout"
-            
-        except Exception as e:
-            logger.error(f"Error calling {provider.name}: {e}")
-            return self._error_response(502, f"Upstream error: {str(e)}"), "server_error"
-    
+        except Exception as exc:
+            logger.exception("Unexpected provider error")
+            return self._error_response(502, f"Upstream error: {exc}"), "server_error"
+
     @staticmethod
     def _classify_error(status_code: int) -> str:
-        """
-        分类 HTTP 错误类型
-        
-        Returns:
-            "client_error"  - 400，客户端请求错误，不应重试
-            "auth_error"    - 401/403/429，认证或限流错误，跳过此 provider
-            "server_error"  - 5xx 等，可重试
-        """
         if status_code == 400:
             return "client_error"
         if status_code in (401, 403, 429):
             return "auth_error"
         return "server_error"
-    
+
     def _send_request(
-        self, provider: ProviderConfig, body: dict,
-        endpoint: str, is_stream: bool,
-        need_convert_stream: bool, need_convert_non_stream: bool,
-        model_name: str = None
+        self,
+        provider: ProviderConfig,
+        body: dict,
+        endpoint: str,
+        is_stream: bool,
+        need_convert_stream: bool,
+        need_convert_non_stream: bool,
+        model_name: Optional[str],
+        client_format: str,
     ) -> Tuple[Response, int, int]:
-        """
-        发送实际请求
-        
-        Returns:
-            (response, status_code, tokens_used)
-        """
-        url = f"{provider.endpoint.rstrip('/')}{endpoint}"
-        
-        headers = {
-            "Authorization": f"Bearer {provider.api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        if provider.custom_headers:
-            headers.update(provider.custom_headers)
-        
+        provider_format = provider.format
+        upstream_body, upstream_endpoint = self._build_upstream_request(provider, body, endpoint, is_stream)
+        url = self._build_upstream_url(provider.endpoint, upstream_endpoint, provider_format, is_stream)
+        headers = self._build_headers(provider)
+
         if is_stream:
-            # 流式请求
             return self._handle_stream_request(
-                url, headers, body, provider.timeout,
-                model_name, provider.name
+                url=url,
+                headers=headers,
+                body=upstream_body,
+                timeout=provider.timeout,
+                model_name=model_name,
+                provider_name=provider.name,
+                provider_format=provider_format,
+                client_format=client_format,
             )
-        elif need_convert_non_stream:
-            # 需要将流式响应转换为非流式
-            return self._convert_to_non_stream(provider, body, endpoint)
-        else:
-            # 标准非流式请求
-            with httpx.Client(timeout=provider.timeout) as client:
-                response = client.post(url, json=body, headers=headers)
-                
-                if response.status_code == 200:
-                    response_data = response.json()
-                    
-                    usage = response_data.get("usage", {})
-                    tokens_used = usage.get("total_tokens", 0)
-                    
-                    if need_convert_stream:
-                        return self._convert_to_stream(response_data), 200, tokens_used
-                    
-                    return Response(
-                        response.content,
-                        status=response.status_code,
-                        content_type="application/json"
-                    ), response.status_code, tokens_used
-                else:
-                    return Response(
-                        response.content,
-                        status=response.status_code,
-                        content_type="application/json"
-                    ), response.status_code, 0
-    
+        if need_convert_non_stream:
+            return self._convert_to_non_stream(
+                provider=provider,
+                body=upstream_body,
+                endpoint=upstream_endpoint,
+                client_format=client_format,
+                provider_format=provider_format,
+                model_name=body.get("model"),
+            )
+
+        with httpx.Client(timeout=provider.timeout) as client:
+            response = client.post(url, json=upstream_body, headers=headers)
+
+        if not (200 <= response.status_code < 300):
+            return Response(response.content, status=response.status_code, content_type="application/json"), response.status_code, 0
+
+        if endpoint != "/chat/completions":
+            tokens = 0
+            try:
+                tokens = response.json().get("usage", {}).get("total_tokens", 0)
+            except Exception:
+                pass
+            if need_convert_stream:
+                try:
+                    return self._convert_to_stream(response.json(), client_format), 200, tokens
+                except Exception:
+                    return self._error_response(502, "Cannot convert non-JSON response to stream"), 502, 0
+            return Response(response.content, status=response.status_code, content_type="application/json"), response.status_code, tokens
+
+        try:
+            provider_data = response.json()
+        except Exception:
+            return Response(response.content, status=response.status_code, content_type="application/json"), response.status_code, 0
+
+        openai_data = self._provider_response_to_openai(provider_data, provider_format, body.get("model"))
+        tokens = self._extract_tokens_from_provider_response(provider_data, provider_format, openai_data)
+
+        if need_convert_stream:
+            return self._convert_to_stream(openai_data, client_format), 200, tokens
+
+        client_data = self._convert_openai_response_to_client(openai_data, client_format)
+        return self._json_response(client_data), 200, tokens
+
     def _handle_stream_request(
-        self, url: str, headers: dict, body: dict, timeout: int,
-        model_name: str = None, provider_name: str = None
+        self,
+        url: str,
+        headers: dict,
+        body: dict,
+        timeout: int,
+        model_name: Optional[str],
+        provider_name: Optional[str],
+        provider_format: str,
+        client_format: str,
     ) -> Tuple[Response, int, int]:
-        """
-        处理流式请求
-        
-        - 请求伊始出错（HTTP 状态码非 200）：返回实际状态码，触发故障转移
-        - 流式传输中途出错：正常中断流，不触发故障转移
-        - 流结束后异步记录 token 使用量
-        """
         client = httpx.Client(timeout=timeout)
-        
         try:
             req = client.build_request("POST", url, json=body, headers=headers)
             upstream_response = client.send(req, stream=True)
-            
             if upstream_response.status_code != 200:
-                # 请求伊始就报错，返回实际状态码以触发故障转移
                 error_body = upstream_response.read()
                 upstream_response.close()
                 client.close()
-                return Response(
-                    error_body,
-                    status=upstream_response.status_code,
-                    content_type="application/json"
-                ), upstream_response.status_code, 0
-            
-            # 状态码 200，开始流式传输
+                return Response(error_body, status=upstream_response.status_code, content_type="application/json"), upstream_response.status_code, 0
+
             provider_mgr = self.provider_manager
-            _model_name = model_name
-            _provider_name = provider_name
-            
+            direct = self._is_direct_stream_compatible(client_format, provider_format)
+
             def generate():
-                tokens = 0
+                usage: Dict[str, int] = {}
+                current_event = ""
+                text_buffer = ""
+                finish_reason = "stop"
+                meta: Dict[str, Any] = {"model": body.get("model")}
                 try:
+                    if direct:
+                        for chunk in upstream_response.iter_raw():
+                            if chunk:
+                                yield chunk
+                        return
+
                     for line in upstream_response.iter_lines():
-                        if line:
-                            yield line + "\n"
-                            if line.startswith("data: ") and not line.endswith("[DONE]"):
-                                try:
-                                    data = json.loads(line[6:])
-                                    if "usage" in data:
-                                        tokens = data["usage"].get("total_tokens", 0)
-                                except:
-                                    pass
-                except Exception as e:
-                    # 中途出错，写入错误信息后正常结束流
-                    logger.error(f"Stream interrupted: {e}")
-                    yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                        if line is None:
+                            continue
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        if stripped.startswith("event:"):
+                            current_event = stripped.split(":", 1)[1].strip()
+                            continue
+                        if not stripped.startswith("data:"):
+                            continue
+
+                        payload = stripped[5:].strip()
+                        if payload == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(payload)
+                        except Exception:
+                            continue
+
+                        piece, finish, usage_update, meta_update = self._parse_stream_chunk(provider_format, current_event, data)
+                        if piece:
+                            text_buffer += piece
+                        if finish:
+                            finish_reason = finish
+                        if usage_update:
+                            usage.update(usage_update)
+                        if meta_update:
+                            meta.update(meta_update)
+
+                    openai_data = self._build_openai_response_from_stream_content(text_buffer, finish_reason, usage, meta)
+                    for item in self._iter_stream_payload(openai_data, client_format):
+                        yield item.encode("utf-8")
+                except Exception as exc:
+                    yield f"data: {json.dumps({'error': str(exc)})}\n\n".encode("utf-8")
                 finally:
                     upstream_response.close()
                     client.close()
-                    # 流结束后记录 token 使用量
-                    if _model_name and _provider_name and tokens > 0:
-                        provider_mgr.record_stream_tokens(
-                            _model_name, _provider_name, tokens
-                        )
-            
-            return Response(
+                    total_tokens = usage.get("total_tokens", 0)
+                    if model_name and provider_name and total_tokens > 0:
+                        provider_mgr.record_stream_tokens(model_name, provider_name, total_tokens)
+
+            response = Response(
                 stream_with_context(generate()),
                 status=200,
                 content_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no"
-                }
-            ), 200, 0
-            
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+            )
+            return response, 200, 0
         except Exception:
             client.close()
             raise
-    
-    def _convert_to_stream(self, response_data: dict) -> Response:
-        """将非流式响应转换为流式格式"""
-        
-        def generate():
-            choices = response_data.get("choices", [])
-            for choice in choices:
-                chunk = {
-                    "id": response_data.get("id", ""),
-                    "object": "chat.completion.chunk",
-                    "created": response_data.get("created", 0),
-                    "model": response_data.get("model", ""),
-                    "choices": [{
-                        "index": choice.get("index", 0),
-                        "delta": {
-                            "role": "assistant",
-                            "content": choice.get("message", {}).get("content", "")
-                        },
-                        "finish_reason": choice.get("finish_reason")
-                    }]
-                }
-                yield f"data: {json.dumps(chunk)}\n\n"
-            
-            yield "data: [DONE]\n\n"
-        
-        return Response(
-            stream_with_context(generate()),
-            status=200,
-            content_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive"
-            }
-        )
-    
+
     def _convert_to_non_stream(
-        self, provider: ProviderConfig,
-        body: dict, endpoint: str
+        self,
+        provider: ProviderConfig,
+        body: dict,
+        endpoint: str,
+        client_format: str,
+        provider_format: str,
+        model_name: Optional[str],
     ) -> Tuple[Response, int, int]:
-        """将流式响应转换为非流式格式"""
-        url = f"{provider.endpoint.rstrip('/')}{endpoint}"
-        
-        headers = {
-            "Authorization": f"Bearer {provider.api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        if provider.custom_headers:
-            headers.update(provider.custom_headers)
-        
-        full_content = ""
-        response_data = {}
-        
+        url = self._build_upstream_url(provider.endpoint, endpoint, provider_format, is_stream=True)
+        headers = self._build_headers(provider)
+
+        usage: Dict[str, int] = {}
+        content = ""
+        finish_reason = "stop"
+        meta: Dict[str, Any] = {"model": model_name or body.get("model")}
+        current_event = ""
+
         try:
             with httpx.Client(timeout=provider.timeout) as client:
                 with client.stream("POST", url, json=body, headers=headers) as response:
                     if response.status_code != 200:
-                        return Response(
-                            response.read(),
-                            status=response.status_code,
-                            content_type="application/json"
-                        ), response.status_code, 0
-                    
+                        return Response(response.read(), status=response.status_code, content_type="application/json"), response.status_code, 0
+
                     for line in response.iter_lines():
-                        if line.startswith("data: "):
-                            data_str = line[6:]
-                            if data_str == "[DONE]":
-                                break
-                            try:
-                                chunk = json.loads(data_str)
-                                if not response_data:
-                                    response_data = {
-                                        "id": chunk.get("id", ""),
-                                        "object": "chat.completion",
-                                        "created": chunk.get("created", 0),
-                                        "model": chunk.get("model", ""),
-                                        "choices": [{
-                                            "index": 0,
-                                            "message": {"role": "assistant", "content": ""},
-                                            "finish_reason": None
-                                        }],
-                                        "usage": {
-                                            "prompt_tokens": 0,
-                                            "completion_tokens": 0,
-                                            "total_tokens": 0
-                                        }
-                                    }
-                                
-                                for choice in chunk.get("choices", []):
-                                    delta = choice.get("delta", {})
-                                    if "content" in delta:
-                                        full_content += delta["content"]
-                                    if choice.get("finish_reason"):
-                                        response_data["choices"][0]["finish_reason"] = choice["finish_reason"]
-                                
-                                # 使用流中的准确 usage（如果有）
-                                if "usage" in chunk:
-                                    response_data["usage"] = chunk["usage"]
-                            except json.JSONDecodeError:
-                                continue
-            
-            if not response_data:
-                return self._error_response(502, "Empty stream response"), 502, 0
-            
-            response_data["choices"][0]["message"]["content"] = full_content
-            
-            # 如果没有从流中获取到准确 usage，则估算
-            if response_data["usage"]["total_tokens"] == 0:
-                estimated_tokens = len(full_content) // 4
-                response_data["usage"]["completion_tokens"] = estimated_tokens
-                response_data["usage"]["total_tokens"] = estimated_tokens
-            
-            total_tokens = response_data["usage"].get("total_tokens", 0)
-            
-            return Response(
-                json.dumps(response_data),
-                status=200,
-                content_type="application/json"
-            ), 200, total_tokens
-            
-        except Exception as e:
-            return self._error_response(502, f"Stream conversion error: {e}"), 502, 0
-    
+                        if line is None:
+                            continue
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        if stripped.startswith("event:"):
+                            current_event = stripped.split(":", 1)[1].strip()
+                            continue
+                        if not stripped.startswith("data:"):
+                            continue
+
+                        payload = stripped[5:].strip()
+                        if payload == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(payload)
+                        except Exception:
+                            continue
+
+                        piece, finish, usage_update, meta_update = self._parse_stream_chunk(provider_format, current_event, data)
+                        if piece:
+                            content += piece
+                        if finish:
+                            finish_reason = finish
+                        if usage_update:
+                            usage.update(usage_update)
+                        if meta_update:
+                            meta.update(meta_update)
+
+            if not usage.get("total_tokens"):
+                estimated = max(1, len(content) // 4) if content else 0
+                usage = {
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "completion_tokens": usage.get("completion_tokens", estimated),
+                    "total_tokens": usage.get("total_tokens", usage.get("prompt_tokens", 0) + estimated),
+                }
+
+            openai_data = self._build_openai_response_from_stream_content(content, finish_reason, usage, meta)
+            client_data = self._convert_openai_response_to_client(openai_data, client_format)
+            return self._json_response(client_data), 200, usage.get("total_tokens", 0)
+        except Exception as exc:
+            return self._error_response(502, f"Stream conversion error: {exc}"), 502, 0
+
+    def _convert_to_stream(self, response_data: dict, client_format: str) -> Response:
+        return Response(
+            stream_with_context(self._iter_stream_payload(response_data, client_format)),
+            status=200,
+            content_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
+
+    def _iter_stream_payload(self, response_data: dict, client_format: str) -> Iterable[str]:
+        if client_format == CLIENT_FORMAT_CLAUDE:
+            choice = (response_data.get("choices") or [{}])[0]
+            usage = response_data.get("usage", {})
+            text = self._openai_content_to_text(choice.get("message", {}).get("content", ""))
+
+            yield "event: message_start\n"
+            yield f"data: {json.dumps({'type': 'message_start', 'message': {'id': response_data.get('id'), 'type': 'message', 'role': 'assistant', 'model': response_data.get('model'), 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': usage.get('prompt_tokens', 0), 'output_tokens': 0}}})}\n\n"
+            yield "event: content_block_start\n"
+            yield "data: {\"type\": \"content_block_start\", \"index\": 0, \"content_block\": {\"type\": \"text\", \"text\": \"\"}}\n\n"
+            if text:
+                yield "event: content_block_delta\n"
+                yield f"data: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': text}})}\n\n"
+            yield "event: content_block_stop\n"
+            yield "data: {\"type\": \"content_block_stop\", \"index\": 0}\n\n"
+            yield "event: message_delta\n"
+            yield f"data: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': self._openai_finish_to_claude(choice.get('finish_reason')), 'stop_sequence': None}, 'usage': {'output_tokens': usage.get('completion_tokens', 0)}})}\n\n"
+            yield "event: message_stop\n"
+            yield "data: {\"type\": \"message_stop\"}\n\n"
+            return
+
+        if client_format == CLIENT_FORMAT_GEMINI:
+            usage = response_data.get("usage", {})
+            for choice in response_data.get("choices", []):
+                text = self._openai_content_to_text(choice.get("message", {}).get("content", ""))
+                chunk = {
+                    "candidates": [
+                        {
+                            "index": choice.get("index", 0),
+                            "content": {"role": "model", "parts": [{"text": text}]},
+                            "finishReason": self._openai_finish_to_gemini(choice.get("finish_reason")),
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": usage.get("prompt_tokens", 0),
+                        "candidatesTokenCount": usage.get("completion_tokens", 0),
+                        "totalTokenCount": usage.get("total_tokens", 0),
+                    },
+                    "modelVersion": response_data.get("model", ""),
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
+            return
+
+        for choice in response_data.get("choices", []):
+            chunk = {
+                "id": response_data.get("id", ""),
+                "object": "chat.completion.chunk",
+                "created": response_data.get("created", int(time.time())),
+                "model": response_data.get("model", ""),
+                "choices": [
+                    {
+                        "index": choice.get("index", 0),
+                        "delta": {
+                            "role": "assistant",
+                            "content": self._openai_content_to_text(choice.get("message", {}).get("content", "")),
+                        },
+                        "finish_reason": choice.get("finish_reason"),
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    @staticmethod
+    def _build_upstream_url(base: str, endpoint: str, provider_format: str, is_stream: bool) -> str:
+        url = f"{base.rstrip('/')}{endpoint}"
+        if provider_format == PROVIDER_FORMAT_GEMINI and is_stream:
+            parsed = urlparse(url)
+            query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            query.setdefault("alt", "sse")
+            parsed = parsed._replace(query=urlencode(query))
+            return urlunparse(parsed)
+        return url
+
+    def _build_upstream_request(self, provider: ProviderConfig, body: dict, endpoint: str, is_stream: bool) -> Tuple[dict, str]:
+        provider_format = provider.format
+        if endpoint != "/chat/completions":
+            return body, endpoint
+
+        if provider_format == PROVIDER_FORMAT_OPENAI:
+            return body, endpoint
+        if provider_format == PROVIDER_FORMAT_OPENAI_RESPONSE:
+            return self._openai_to_provider_request_openai_response(body), "/responses"
+        if provider_format == PROVIDER_FORMAT_CLAUDE:
+            return self._openai_to_provider_request_claude(body), "/messages"
+        if provider_format == PROVIDER_FORMAT_GEMINI:
+            safe_model = quote(str(body.get("model", "")).replace("models/", ""), safe="-_.~")
+            action = "streamGenerateContent" if is_stream else "generateContent"
+            return self._openai_to_provider_request_gemini(body), f"/models/{safe_model}:{action}"
+        return body, endpoint
+
+    @staticmethod
+    def _build_headers(provider: ProviderConfig) -> Dict[str, str]:
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
+        if provider.format == PROVIDER_FORMAT_CLAUDE:
+            headers["x-api-key"] = provider.api_key
+            headers["anthropic-version"] = "2023-06-01"
+        elif provider.format == PROVIDER_FORMAT_GEMINI:
+            headers["x-goog-api-key"] = provider.api_key
+        else:
+            headers["Authorization"] = f"Bearer {provider.api_key}"
+        if provider.custom_headers:
+            headers.update(provider.custom_headers)
+        return headers
+
+    def _parse_stream_chunk(self, provider_format: str, current_event: str, chunk: dict) -> Tuple[str, Optional[str], Dict[str, int], Dict[str, Any]]:
+        usage: Dict[str, int] = {}
+        meta: Dict[str, Any] = {}
+        finish_reason: Optional[str] = None
+        text_delta = ""
+
+        if provider_format == PROVIDER_FORMAT_CLAUDE:
+            if current_event == "message_start":
+                message = chunk.get("message", {})
+                meta["id"] = message.get("id")
+                meta["model"] = message.get("model")
+                c_usage = message.get("usage", {})
+                usage = {
+                    "prompt_tokens": c_usage.get("input_tokens", 0),
+                    "completion_tokens": c_usage.get("output_tokens", 0),
+                    "total_tokens": c_usage.get("input_tokens", 0) + c_usage.get("output_tokens", 0),
+                }
+            elif current_event == "content_block_delta":
+                delta = chunk.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    text_delta = delta.get("text", "")
+            elif current_event == "message_delta":
+                delta = chunk.get("delta", {})
+                finish_reason = self._normalize_finish_reason(delta.get("stop_reason"))
+                c_usage = chunk.get("usage", {})
+                if c_usage:
+                    output_tokens = c_usage.get("output_tokens", 0)
+                    usage["completion_tokens"] = output_tokens
+                    usage["total_tokens"] = usage.get("prompt_tokens", 0) + output_tokens
+            return text_delta, finish_reason, usage, meta
+
+        if provider_format == PROVIDER_FORMAT_GEMINI:
+            for candidate in chunk.get("candidates", []):
+                for part in candidate.get("content", {}).get("parts", []):
+                    if "text" in part:
+                        text_delta += part.get("text", "")
+                if candidate.get("finishReason"):
+                    finish_reason = self._normalize_finish_reason(candidate.get("finishReason"))
+            g_usage = chunk.get("usageMetadata", {})
+            if g_usage:
+                usage = {
+                    "prompt_tokens": g_usage.get("promptTokenCount", 0),
+                    "completion_tokens": g_usage.get("candidatesTokenCount", 0),
+                    "total_tokens": g_usage.get("totalTokenCount", 0),
+                }
+            if chunk.get("modelVersion"):
+                meta["model"] = chunk.get("modelVersion")
+            return text_delta, finish_reason, usage, meta
+
+        for choice in chunk.get("choices", []):
+            delta = choice.get("delta", {})
+            text_delta += delta.get("content", "")
+            if choice.get("finish_reason"):
+                finish_reason = self._normalize_finish_reason(choice.get("finish_reason"))
+        o_usage = chunk.get("usage", {})
+        if o_usage:
+            usage = {
+                "prompt_tokens": o_usage.get("prompt_tokens", 0),
+                "completion_tokens": o_usage.get("completion_tokens", 0),
+                "total_tokens": o_usage.get("total_tokens", 0),
+            }
+        if chunk.get("id"):
+            meta["id"] = chunk.get("id")
+        if chunk.get("model"):
+            meta["model"] = chunk.get("model")
+        if chunk.get("created"):
+            meta["created"] = chunk.get("created")
+        return text_delta, finish_reason, usage, meta
+
+    def _build_openai_response_from_stream_content(self, content: str, finish_reason: str, usage: Dict[str, int], meta: Dict[str, Any]) -> Dict[str, Any]:
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
+        if completion_tokens == 0 and total_tokens > 0 and prompt_tokens == 0:
+            completion_tokens = total_tokens
+
+        return {
+            "id": meta.get("id", f"chatcmpl_{int(time.time() * 1000)}"),
+            "object": "chat.completion",
+            "created": meta.get("created", int(time.time())),
+            "model": meta.get("model", ""),
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": finish_reason or "stop"}],
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens},
+        }
+
+    def _extract_tokens_from_provider_response(self, provider_data: dict, provider_format: str, openai_data: Optional[dict] = None) -> int:
+        if provider_format == PROVIDER_FORMAT_OPENAI_RESPONSE:
+            return provider_data.get("usage", {}).get("total_tokens", 0)
+        if provider_format == PROVIDER_FORMAT_CLAUDE:
+            usage = provider_data.get("usage", {})
+            return usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+        if provider_format == PROVIDER_FORMAT_GEMINI:
+            return provider_data.get("usageMetadata", {}).get("totalTokenCount", 0)
+        if openai_data:
+            return openai_data.get("usage", {}).get("total_tokens", 0)
+        return provider_data.get("usage", {}).get("total_tokens", 0)
+
+    def _provider_response_to_openai(self, data: dict, provider_format: str, model_fallback: Optional[str]) -> dict:
+        if provider_format == PROVIDER_FORMAT_OPENAI:
+            return data
+
+        if provider_format == PROVIDER_FORMAT_OPENAI_RESPONSE:
+            output_text = data.get("output_text")
+            if isinstance(output_text, list):
+                text = "".join([str(item) for item in output_text])
+            elif isinstance(output_text, str):
+                text = output_text
+            else:
+                text = ""
+                for item in data.get("output", []):
+                    if item.get("type") == "message":
+                        for content in item.get("content", []):
+                            if content.get("type") in ("output_text", "text"):
+                                text += content.get("text", "")
+                    elif item.get("type") == "output_text":
+                        text += item.get("text", "")
+            usage = data.get("usage", {})
+            return {
+                "id": data.get("id", f"chatcmpl_{int(time.time() * 1000)}"),
+                "object": "chat.completion",
+                "created": data.get("created_at", int(time.time())),
+                "model": data.get("model", model_fallback or ""),
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": usage.get("input_tokens", 0),
+                    "completion_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                },
+            }
+
+        if provider_format == PROVIDER_FORMAT_CLAUDE:
+            text = ""
+            tool_calls = []
+            for block in data.get("content", []):
+                if block.get("type") == "text":
+                    text += block.get("text", "")
+                elif block.get("type") == "tool_use":
+                    tool_input = block.get("input", {})
+                    arguments = tool_input if isinstance(tool_input, str) else json.dumps(tool_input, ensure_ascii=False)
+                    tool_calls.append(
+                        {
+                            "id": block.get("id", f"call_{int(time.time() * 1000)}"),
+                            "type": "function",
+                            "function": {"name": block.get("name", "tool"), "arguments": arguments},
+                        }
+                    )
+            usage = data.get("usage", {})
+            message_payload: dict = {"role": "assistant", "content": text}
+            if tool_calls:
+                message_payload["tool_calls"] = tool_calls
+            return {
+                "id": data.get("id", f"chatcmpl_{int(time.time() * 1000)}"),
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": data.get("model", model_fallback or ""),
+                "choices": [{"index": 0, "message": message_payload, "finish_reason": self._normalize_finish_reason(data.get("stop_reason", "end_turn"))}],
+                "usage": {
+                    "prompt_tokens": usage.get("input_tokens", 0),
+                    "completion_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+                },
+            }
+
+        if provider_format == PROVIDER_FORMAT_GEMINI:
+            candidates = data.get("candidates", [])
+            candidate = candidates[0] if candidates else {}
+            text = ""
+            tool_calls = []
+            for part in candidate.get("content", {}).get("parts", []):
+                if "text" in part:
+                    text += part.get("text", "")
+                elif "functionCall" in part:
+                    function_call = part.get("functionCall", {})
+                    arguments = function_call.get("args", {})
+                    arguments = arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
+                    tool_calls.append(
+                        {
+                            "id": f"call_{int(time.time() * 1000)}_{len(tool_calls)}",
+                            "type": "function",
+                            "function": {"name": function_call.get("name", "tool"), "arguments": arguments},
+                        }
+                    )
+            usage = data.get("usageMetadata", {})
+            message_payload: dict = {"role": "assistant", "content": text}
+            if tool_calls:
+                message_payload["tool_calls"] = tool_calls
+            return {
+                "id": f"chatcmpl_{int(time.time() * 1000)}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": data.get("modelVersion", model_fallback or ""),
+                "choices": [{"index": 0, "message": message_payload, "finish_reason": self._normalize_finish_reason(candidate.get("finishReason", "STOP"))}],
+                "usage": {
+                    "prompt_tokens": usage.get("promptTokenCount", 0),
+                    "completion_tokens": usage.get("candidatesTokenCount", 0),
+                    "total_tokens": usage.get("totalTokenCount", 0),
+                },
+            }
+
+        return data
+
+    def _convert_openai_response_to_client(self, openai_data: dict, client_format: str) -> dict:
+        if client_format == CLIENT_FORMAT_CLAUDE:
+            return self._openai_to_claude_response(openai_data)
+        if client_format == CLIENT_FORMAT_GEMINI:
+            return self._openai_to_gemini_response(openai_data)
+        return openai_data
+
+    def _openai_to_claude_response(self, openai_data: dict) -> dict:
+        choice = (openai_data.get("choices") or [{}])[0]
+        usage = openai_data.get("usage", {})
+        message = choice.get("message", {})
+        text = self._openai_content_to_text(message.get("content", ""))
+        content_blocks = [{"type": "text", "text": text}]
+        for tool_call in self._safe_list(message.get("tool_calls")):
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function", {})
+            raw_arguments = function.get("arguments", {})
+            if isinstance(raw_arguments, str):
+                try:
+                    parsed_arguments = json.loads(raw_arguments)
+                except Exception:
+                    parsed_arguments = {"raw": raw_arguments}
+            else:
+                parsed_arguments = raw_arguments if isinstance(raw_arguments, dict) else {"raw": str(raw_arguments)}
+            content_blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": tool_call.get("id", f"tool_{int(time.time() * 1000)}"),
+                    "name": function.get("name", "tool"),
+                    "input": parsed_arguments,
+                }
+            )
+        return {
+            "id": openai_data.get("id", f"msg_{int(time.time() * 1000)}"),
+            "type": "message",
+            "role": "assistant",
+            "model": openai_data.get("model", ""),
+            "content": content_blocks,
+            "stop_reason": self._openai_finish_to_claude(choice.get("finish_reason")),
+            "stop_sequence": None,
+            "usage": {"input_tokens": usage.get("prompt_tokens", 0), "output_tokens": usage.get("completion_tokens", 0)},
+        }
+
+    def _openai_to_gemini_response(self, openai_data: dict) -> dict:
+        usage = openai_data.get("usage", {})
+        candidates = []
+        for choice in openai_data.get("choices", []):
+            message = choice.get("message", {})
+            parts = self._openai_content_to_gemini_parts(message.get("content", ""))
+            for tool_call in self._safe_list(message.get("tool_calls")):
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function", {})
+                raw_arguments = function.get("arguments", {})
+                if isinstance(raw_arguments, str):
+                    try:
+                        parsed_arguments = json.loads(raw_arguments)
+                    except Exception:
+                        parsed_arguments = {"raw": raw_arguments}
+                else:
+                    parsed_arguments = raw_arguments if isinstance(raw_arguments, dict) else {"raw": str(raw_arguments)}
+                parts.append(
+                    {
+                        "functionCall": {
+                            "name": function.get("name", "tool"),
+                            "args": parsed_arguments,
+                        }
+                    }
+                )
+            candidates.append(
+                {
+                    "index": choice.get("index", 0),
+                    "content": {"role": "model", "parts": parts},
+                    "finishReason": self._openai_finish_to_gemini(choice.get("finish_reason")),
+                }
+            )
+        return {
+            "candidates": candidates,
+            "usageMetadata": {
+                "promptTokenCount": usage.get("prompt_tokens", 0),
+                "candidatesTokenCount": usage.get("completion_tokens", 0),
+                "totalTokenCount": usage.get("total_tokens", 0),
+            },
+            "modelVersion": openai_data.get("model", ""),
+        }
+
+    def _detect_client_format(self, body: dict, endpoint: str) -> str:
+        if endpoint != "/chat/completions":
+            return CLIENT_FORMAT_OPENAI
+        if "contents" in body or "generationConfig" in body or "systemInstruction" in body:
+            return CLIENT_FORMAT_GEMINI
+        if "anthropic_version" in body or "stop_sequences" in body or "anthropic_beta" in body:
+            return CLIENT_FORMAT_CLAUDE
+        if "system" in body and "messages" in body:
+            return CLIENT_FORMAT_CLAUDE
+        if self._looks_like_claude_messages(body.get("messages")):
+            return CLIENT_FORMAT_CLAUDE
+        return CLIENT_FORMAT_OPENAI
+
+    @staticmethod
+    def _looks_like_claude_messages(messages: Any) -> bool:
+        if not isinstance(messages, list) or not messages:
+            return False
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") in ("text", "image", "tool_use", "tool_result"):
+                        return True
+        return False
+
+    def _convert_client_request_to_openai(
+        self,
+        body: dict,
+        endpoint: str,
+        client_format: str,
+        route_model: Optional[str],
+        route_stream: Optional[bool],
+    ) -> dict:
+        if endpoint != "/chat/completions":
+            result = body.copy()
+            if route_model and "model" not in result:
+                result["model"] = route_model
+            if route_stream is not None and "stream" not in result:
+                result["stream"] = route_stream
+            return result
+
+        if client_format == CLIENT_FORMAT_CLAUDE:
+            return self._openai_request_from_claude(body, route_model, route_stream)
+        if client_format == CLIENT_FORMAT_GEMINI:
+            return self._openai_request_from_gemini(body, route_model, route_stream)
+        return self._openai_request_from_openai(body, route_model, route_stream)
+
+    def _openai_request_from_openai(self, body: dict, route_model: Optional[str], route_stream: Optional[bool]) -> dict:
+        result = body.copy()
+        if route_model and "model" not in result:
+            result["model"] = route_model
+        if route_stream is not None and "stream" not in result:
+            result["stream"] = route_stream
+        return result
+
+    def _openai_request_from_claude(self, body: dict, route_model: Optional[str], route_stream: Optional[bool]) -> dict:
+        known_keys = {
+            "model", "messages", "system", "max_tokens", "temperature", "top_p", "top_k", "stream", "stop_sequences", "tools", "tool_choice"
+        }
+        result = self._passthrough_fields(body, known_keys)
+        result["model"] = body.get("model") or route_model
+        result["messages"] = []
+        if "system" in body:
+            result["messages"].append({"role": "system", "content": self._claude_content_to_openai(body.get("system"))})
+        for msg in self._safe_list(body.get("messages")):
+            if not isinstance(msg, dict):
+                continue
+            result["messages"].extend(self._claude_message_to_openai_messages(msg))
+
+        for key in ("max_tokens", "temperature", "top_p", "top_k"):
+            if key in body:
+                result[key] = body.get(key)
+        if "stop_sequences" in body:
+            result["stop"] = body.get("stop_sequences")
+        if "tools" in body:
+            result["tools"] = self._claude_tools_to_openai_tools(body.get("tools") or [])
+        if "tool_choice" in body:
+            result["tool_choice"] = self._convert_tool_choice_to_openai(body.get("tool_choice"))
+        result["stream"] = bool(body.get("stream", route_stream if route_stream is not None else False))
+        return result
+
+    def _openai_request_from_gemini(self, body: dict, route_model: Optional[str], route_stream: Optional[bool]) -> dict:
+        known_keys = {
+            "model", "contents", "systemInstruction", "generationConfig", "tools", "toolConfig", "safetySettings", "cachedContent", "stream"
+        }
+        result = self._passthrough_fields(body, known_keys)
+        result["model"] = body.get("model") or route_model
+        result["messages"] = []
+
+        system_instruction = body.get("systemInstruction")
+        if system_instruction is not None:
+            if isinstance(system_instruction, dict):
+                content = self._gemini_parts_to_openai_content(system_instruction.get("parts", []))
+            else:
+                content = str(system_instruction)
+            result["messages"].append({"role": "system", "content": content})
+
+        for item in self._safe_list(body.get("contents")):
+            if not isinstance(item, dict):
+                continue
+            result["messages"].extend(self._gemini_item_to_openai_messages(item))
+
+        cfg = body.get("generationConfig", {}) or {}
+        mapping = {
+            "temperature": "temperature",
+            "topP": "top_p",
+            "topK": "top_k",
+            "maxOutputTokens": "max_tokens",
+            "candidateCount": "n",
+            "stopSequences": "stop",
+            "presencePenalty": "presence_penalty",
+            "frequencyPenalty": "frequency_penalty",
+        }
+        for src, dst in mapping.items():
+            if src in cfg:
+                result[dst] = cfg.get(src)
+
+        if body.get("tools"):
+            result["tools"] = self._gemini_tools_to_openai_tools(body.get("tools") or [])
+        if body.get("toolConfig"):
+            result["tool_choice"] = self._gemini_tool_config_to_openai(body.get("toolConfig"))
+        if "safetySettings" in body:
+            result["safetySettings"] = body.get("safetySettings")
+        if "cachedContent" in body:
+            result["cachedContent"] = body.get("cachedContent")
+        if cfg:
+            result["gemini_generation_config"] = cfg
+        result["stream"] = bool(body.get("stream", route_stream if route_stream is not None else False))
+        return result
+
+    def _openai_to_provider_request_openai_response(self, body: dict) -> dict:
+        known = {"model", "messages", "max_tokens", "max_completion_tokens", "temperature", "top_p", "stream", "tools", "tool_choice", "n", "stop"}
+        result = self._passthrough_fields(body, known)
+        result["model"] = body.get("model")
+        result["input"] = []
+
+        instructions = []
+        for msg in self._safe_list(body.get("messages")):
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role", "user")
+            if role == "system":
+                instructions.append(self._openai_content_to_text(msg.get("content", "")))
+                continue
+            result["input"].append({"role": role if role in ("user", "assistant", "developer") else "user", "content": self._openai_content_to_response_input(msg.get("content", ""))})
+        if instructions:
+            result["instructions"] = "\n\n".join([x for x in instructions if x])
+
+        max_tokens = body.get("max_tokens", body.get("max_completion_tokens"))
+        if max_tokens is not None:
+            result["max_output_tokens"] = max_tokens
+        for key in ("temperature", "top_p", "stream", "tools", "tool_choice", "stop"):
+            if key in body:
+                result[key] = body.get(key)
+        return result
+
+    def _openai_to_provider_request_claude(self, body: dict) -> dict:
+        known = {"model", "messages", "max_tokens", "max_completion_tokens", "temperature", "top_p", "top_k", "stream", "stop", "tools", "tool_choice", "metadata", "system"}
+        result = self._passthrough_fields(body, known)
+        result["model"] = body.get("model")
+
+        system_blocks, messages = self._openai_messages_to_claude(body.get("messages", []))
+        result["messages"] = messages
+        if system_blocks:
+            if len(system_blocks) == 1 and system_blocks[0].get("type") == "text":
+                result["system"] = system_blocks[0].get("text", "")
+            else:
+                result["system"] = system_blocks
+
+        max_tokens = body.get("max_tokens", body.get("max_completion_tokens"))
+        result["max_tokens"] = max_tokens if max_tokens is not None else 1024
+        for key in ("temperature", "top_p", "top_k", "stream", "metadata"):
+            if key in body:
+                result[key] = body.get(key)
+        if "stop" in body:
+            stop = body.get("stop")
+            result["stop_sequences"] = stop if isinstance(stop, list) else [stop]
+        if "tools" in body:
+            result["tools"] = self._openai_tools_to_claude_tools(body.get("tools") or [])
+        if "tool_choice" in body:
+            result["tool_choice"] = self._convert_tool_choice_to_claude(body.get("tool_choice"))
+        result.setdefault("anthropic_version", "2023-06-01")
+        return result
+
+    def _openai_to_provider_request_gemini(self, body: dict) -> dict:
+        known = {"model", "messages", "stream", "temperature", "top_p", "top_k", "max_tokens", "max_completion_tokens", "n", "stop", "presence_penalty", "frequency_penalty", "tools", "tool_choice", "safetySettings", "cachedContent", "gemini_generation_config"}
+        result = self._passthrough_fields(body, known)
+
+        system_parts, contents = self._openai_messages_to_gemini(body.get("messages", []))
+        result["contents"] = contents
+        if system_parts:
+            result["systemInstruction"] = {"parts": system_parts}
+
+        cfg = dict(body.get("gemini_generation_config") or {})
+        mapping = {
+            "temperature": "temperature",
+            "top_p": "topP",
+            "top_k": "topK",
+            "n": "candidateCount",
+            "presence_penalty": "presencePenalty",
+            "frequency_penalty": "frequencyPenalty",
+        }
+        for src, dst in mapping.items():
+            if src in body:
+                cfg[dst] = body.get(src)
+        max_tokens = body.get("max_tokens", body.get("max_completion_tokens"))
+        if max_tokens is not None:
+            cfg["maxOutputTokens"] = max_tokens
+        if "stop" in body:
+            stop = body.get("stop")
+            cfg["stopSequences"] = stop if isinstance(stop, list) else [stop]
+        if cfg:
+            result["generationConfig"] = cfg
+
+        if "tools" in body:
+            result["tools"] = self._openai_tools_to_gemini_tools(body.get("tools") or [])
+        if "tool_choice" in body:
+            tool_config = self._convert_tool_choice_to_gemini_tool_config(body.get("tool_choice"))
+            if tool_config:
+                result["toolConfig"] = tool_config
+        if "safetySettings" in body:
+            result["safetySettings"] = body.get("safetySettings")
+        if "cachedContent" in body:
+            result["cachedContent"] = body.get("cachedContent")
+        return result
+
+    def _openai_messages_to_claude(self, messages: Any) -> Tuple[List[dict], List[dict]]:
+        system_blocks: List[dict] = []
+        result_messages: List[dict] = []
+        for msg in self._safe_list(messages):
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                system_blocks.extend(self._openai_content_to_claude_blocks(content))
+                continue
+            if role == "tool":
+                result_messages.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": msg.get("tool_call_id", "tool"), "content": self._openai_content_to_text(content)}]})
+                continue
+            blocks = self._openai_content_to_claude_blocks(content)
+            if role == "assistant":
+                for tool_call in self._safe_list(msg.get("tool_calls")):
+                    if not isinstance(tool_call, dict):
+                        continue
+                    function = tool_call.get("function", {})
+                    raw_arguments = function.get("arguments", {})
+                    if isinstance(raw_arguments, str):
+                        try:
+                            parsed_arguments = json.loads(raw_arguments)
+                        except Exception:
+                            parsed_arguments = {"raw": raw_arguments}
+                    else:
+                        parsed_arguments = raw_arguments if isinstance(raw_arguments, dict) else {"raw": str(raw_arguments)}
+                    blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": tool_call.get("id", f"tool_{int(time.time() * 1000)}"),
+                            "name": function.get("name", "tool"),
+                            "input": parsed_arguments,
+                        }
+                    )
+            result_messages.append({"role": "assistant" if role == "assistant" else "user", "content": blocks})
+        return system_blocks, result_messages
+
+    def _openai_messages_to_gemini(self, messages: Any) -> Tuple[List[dict], List[dict]]:
+        system_parts: List[dict] = []
+        contents: List[dict] = []
+        for msg in self._safe_list(messages):
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                system_parts.extend(self._openai_content_to_gemini_parts(content))
+                continue
+            if role == "tool":
+                parts = [{"functionResponse": {"name": msg.get("name", "tool"), "response": {"content": self._openai_content_to_text(content)}}}]
+                contents.append({"role": "user", "parts": parts})
+                continue
+
+            parts = self._openai_content_to_gemini_parts(content)
+            if role == "assistant":
+                for tool_call in self._safe_list(msg.get("tool_calls")):
+                    if not isinstance(tool_call, dict):
+                        continue
+                    function = tool_call.get("function", {})
+                    raw_arguments = function.get("arguments", {})
+                    if isinstance(raw_arguments, str):
+                        try:
+                            parsed_arguments = json.loads(raw_arguments)
+                        except Exception:
+                            parsed_arguments = {"raw": raw_arguments}
+                    else:
+                        parsed_arguments = raw_arguments if isinstance(raw_arguments, dict) else {"raw": str(raw_arguments)}
+                    parts.append({"functionCall": {"name": function.get("name", "tool"), "args": parsed_arguments}})
+            contents.append({"role": "model" if role == "assistant" else "user", "parts": parts})
+        return system_parts, contents
+
+    def _claude_message_to_openai_messages(self, message: dict) -> List[dict]:
+        role = message.get("role", "user")
+        content = message.get("content", "")
+        if not isinstance(content, list):
+            return [{"role": "assistant" if role == "assistant" else "user", "content": self._claude_content_to_openai(content)}]
+
+        text_blocks: List[dict] = []
+        tool_calls: List[dict] = []
+        tool_results: List[dict] = []
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            b_type = block.get("type")
+            if b_type == "text":
+                text_blocks.append({"type": "text", "text": block.get("text", "")})
+            elif b_type == "image":
+                source = block.get("source", {})
+                if source.get("type") == "base64":
+                    mime = source.get("media_type", "image/png")
+                    data = source.get("data", "")
+                    text_blocks.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}})
+            elif b_type == "tool_use":
+                tool_input = block.get("input", {})
+                arguments = tool_input if isinstance(tool_input, str) else json.dumps(tool_input, ensure_ascii=False)
+                tool_calls.append(
+                    {
+                        "id": block.get("id", f"call_{int(time.time() * 1000)}"),
+                        "type": "function",
+                        "function": {"name": block.get("name", "tool"), "arguments": arguments},
+                    }
+                )
+            elif b_type == "tool_result":
+                tool_results.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": block.get("tool_use_id", "tool"),
+                        "content": self._openai_content_to_text(block.get("content", "")),
+                    }
+                )
+
+        messages: List[dict] = []
+        if role == "assistant":
+            assistant_msg: dict = {"role": "assistant"}
+            if len(text_blocks) == 1 and text_blocks[0].get("type") == "text":
+                assistant_msg["content"] = text_blocks[0].get("text", "")
+            else:
+                assistant_msg["content"] = text_blocks
+            if tool_calls:
+                assistant_msg["tool_calls"] = tool_calls
+            messages.append(assistant_msg)
+            return messages
+
+        if text_blocks:
+            if len(text_blocks) == 1 and text_blocks[0].get("type") == "text":
+                messages.append({"role": "user", "content": text_blocks[0].get("text", "")})
+            else:
+                messages.append({"role": "user", "content": text_blocks})
+        messages.extend(tool_results)
+        if not messages:
+            messages.append({"role": "user", "content": ""})
+        return messages
+
+    def _gemini_item_to_openai_messages(self, item: dict) -> List[dict]:
+        role = "assistant" if item.get("role") == "model" else "user"
+        parts = self._safe_list(item.get("parts"))
+        text_parts: List[dict] = []
+        tool_calls: List[dict] = []
+        tool_messages: List[dict] = []
+
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            if "text" in part:
+                text_parts.append({"type": "text", "text": part.get("text", "")})
+            elif "inlineData" in part or "fileData" in part:
+                converted = self._gemini_parts_to_openai_content([part])
+                if isinstance(converted, list):
+                    text_parts.extend(converted)
+                else:
+                    text_parts.append({"type": "text", "text": str(converted)})
+            elif "functionCall" in part:
+                function_call = part.get("functionCall", {})
+                args = function_call.get("args", {})
+                arguments = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+                tool_calls.append(
+                    {
+                        "id": f"call_{int(time.time() * 1000)}_{len(tool_calls)}",
+                        "type": "function",
+                        "function": {"name": function_call.get("name", "tool"), "arguments": arguments},
+                    }
+                )
+            elif "functionResponse" in part:
+                function_response = part.get("functionResponse", {})
+                tool_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": f"call_{function_response.get('name', 'tool')}",
+                        "content": json.dumps(function_response.get("response", {}), ensure_ascii=False),
+                    }
+                )
+
+        openai_messages: List[dict] = []
+        if role == "assistant":
+            assistant_msg: dict = {"role": "assistant"}
+            if len(text_parts) == 1 and text_parts[0].get("type") == "text":
+                assistant_msg["content"] = text_parts[0].get("text", "")
+            else:
+                assistant_msg["content"] = text_parts
+            if tool_calls:
+                assistant_msg["tool_calls"] = tool_calls
+            openai_messages.append(assistant_msg)
+            return openai_messages
+
+        if text_parts:
+            if len(text_parts) == 1 and text_parts[0].get("type") == "text":
+                openai_messages.append({"role": "user", "content": text_parts[0].get("text", "")})
+            else:
+                openai_messages.append({"role": "user", "content": text_parts})
+        openai_messages.extend(tool_messages)
+        if not openai_messages:
+            openai_messages.append({"role": "user", "content": ""})
+        return openai_messages
+
+    @staticmethod
+    def _safe_list(value: Any) -> List[Any]:
+        return value if isinstance(value, list) else []
+
+    @staticmethod
+    def _openai_content_to_response_input(content: Any) -> List[dict]:
+        if isinstance(content, str):
+            return [{"type": "input_text", "text": content}]
+        result = []
+        for part in content or []:
+            if not isinstance(part, dict):
+                continue
+            p_type = part.get("type")
+            if p_type in ("text", "input_text", "output_text"):
+                result.append({"type": "input_text", "text": part.get("text", "")})
+            elif p_type == "image_url":
+                image_url = part.get("image_url")
+                if isinstance(image_url, dict):
+                    image_url = image_url.get("url")
+                result.append({"type": "input_image", "image_url": image_url})
+        return result or [{"type": "input_text", "text": ""}]
+
+    def _claude_content_to_openai(self, content: Any) -> Any:
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return str(content)
+        parts: List[dict] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            b_type = block.get("type")
+            if b_type == "text":
+                parts.append({"type": "text", "text": block.get("text", "")})
+            elif b_type == "image":
+                source = block.get("source", {})
+                if source.get("type") == "base64":
+                    mime = source.get("media_type", "image/png")
+                    data = source.get("data", "")
+                    parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}})
+            elif b_type == "tool_result":
+                parts.append({"type": "text", "text": json.dumps(block, ensure_ascii=False)})
+        if len(parts) == 1 and parts[0].get("type") == "text":
+            return parts[0].get("text", "")
+        return parts or ""
+
+    def _gemini_parts_to_openai_content(self, parts: List[dict]) -> Any:
+        if not isinstance(parts, list):
+            return str(parts)
+        result: List[dict] = []
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            if "text" in part:
+                result.append({"type": "text", "text": part.get("text", "")})
+            elif "inlineData" in part:
+                inline_data = part.get("inlineData", {})
+                mime = inline_data.get("mimeType", "application/octet-stream")
+                data = inline_data.get("data", "")
+                if mime.startswith("image/"):
+                    result.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}})
+                else:
+                    result.append({"type": "text", "text": f"[binary:{mime}]"})
+            elif "fileData" in part:
+                file_data = part.get("fileData", {})
+                uri = file_data.get("fileUri", "")
+                mime = file_data.get("mimeType", "")
+                if mime.startswith("image/"):
+                    result.append({"type": "image_url", "image_url": {"url": uri}})
+                else:
+                    result.append({"type": "text", "text": uri})
+            elif "functionCall" in part or "functionResponse" in part:
+                result.append({"type": "text", "text": json.dumps(part, ensure_ascii=False)})
+        if len(result) == 1 and result[0].get("type") == "text":
+            return result[0].get("text", "")
+        return result or ""
+
+    def _openai_content_to_claude_blocks(self, content: Any) -> List[dict]:
+        if isinstance(content, str):
+            return [{"type": "text", "text": content}]
+        if not isinstance(content, list):
+            return [{"type": "text", "text": str(content)}]
+        blocks: List[dict] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            p_type = part.get("type")
+            if p_type in ("text", "input_text", "output_text"):
+                blocks.append({"type": "text", "text": part.get("text", "")})
+            elif p_type == "image_url":
+                image_url = part.get("image_url")
+                if isinstance(image_url, dict):
+                    image_url = image_url.get("url")
+                parsed = self._parse_data_url(image_url)
+                if parsed:
+                    mime_type, data = parsed
+                    blocks.append({"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": data}})
+                else:
+                    blocks.append({"type": "text", "text": str(image_url)})
+        return blocks or [{"type": "text", "text": ""}]
+
+    def _openai_content_to_gemini_parts(self, content: Any) -> List[dict]:
+        if isinstance(content, str):
+            return [{"text": content}]
+        if not isinstance(content, list):
+            return [{"text": str(content)}]
+        parts: List[dict] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            p_type = part.get("type")
+            if p_type in ("text", "input_text", "output_text"):
+                parts.append({"text": part.get("text", "")})
+            elif p_type == "image_url":
+                image_url = part.get("image_url")
+                if isinstance(image_url, dict):
+                    image_url = image_url.get("url")
+                parsed = self._parse_data_url(image_url)
+                if parsed:
+                    mime_type, data = parsed
+                    parts.append({"inlineData": {"mimeType": mime_type, "data": data}})
+                else:
+                    parts.append({"fileData": {"mimeType": "image/*", "fileUri": image_url}})
+        return parts or [{"text": ""}]
+
+    @staticmethod
+    def _parse_data_url(value: Any) -> Optional[Tuple[str, str]]:
+        if not isinstance(value, str):
+            return None
+        if not value.startswith("data:") or ";base64," not in value:
+            return None
+        prefix, data = value.split(";base64,", 1)
+        mime_type = prefix[5:] or "application/octet-stream"
+        return mime_type, data
+
+    @staticmethod
+    def _openai_content_to_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return str(content)
+        result = []
+        for part in content:
+            if isinstance(part, dict):
+                if part.get("type") in ("text", "input_text", "output_text"):
+                    result.append(part.get("text", ""))
+                elif "text" in part:
+                    result.append(part.get("text", ""))
+        return "".join(result)
+
+    @staticmethod
+    def _openai_tools_to_claude_tools(tools: List[dict]) -> List[dict]:
+        result = []
+        for tool in tools:
+            if tool.get("type") != "function":
+                continue
+            fn = tool.get("function", {})
+            result.append({"name": fn.get("name"), "description": fn.get("description"), "input_schema": fn.get("parameters", {"type": "object", "properties": {}})})
+        return result
+
+    @staticmethod
+    def _claude_tools_to_openai_tools(tools: List[dict]) -> List[dict]:
+        result = []
+        for tool in tools:
+            result.append({"type": "function", "function": {"name": tool.get("name"), "description": tool.get("description"), "parameters": tool.get("input_schema", {"type": "object", "properties": {}})}})
+        return result
+
+    @staticmethod
+    def _openai_tools_to_gemini_tools(tools: List[dict]) -> List[dict]:
+        declarations = []
+        for tool in tools:
+            if tool.get("type") != "function":
+                continue
+            fn = tool.get("function", {})
+            declarations.append({"name": fn.get("name"), "description": fn.get("description"), "parameters": fn.get("parameters", {"type": "object", "properties": {}})})
+        return [{"functionDeclarations": declarations}] if declarations else []
+
+    @staticmethod
+    def _gemini_tools_to_openai_tools(tools: List[dict]) -> List[dict]:
+        result = []
+        for group in tools:
+            for declaration in group.get("functionDeclarations", []):
+                result.append({"type": "function", "function": {"name": declaration.get("name"), "description": declaration.get("description"), "parameters": declaration.get("parameters", {"type": "object", "properties": {}})}})
+        return result
+
+    @staticmethod
+    def _convert_tool_choice_to_claude(tool_choice: Any) -> Any:
+        if isinstance(tool_choice, str):
+            if tool_choice in ("auto", "none", "any"):
+                return {"type": "auto" if tool_choice in ("auto", "none") else "any"}
+            return {"type": "tool", "name": tool_choice}
+        if isinstance(tool_choice, dict):
+            if tool_choice.get("type") == "function":
+                function = tool_choice.get("function", {})
+                return {"type": "tool", "name": function.get("name")}
+            if tool_choice.get("type") in ("auto", "any"):
+                return {"type": tool_choice.get("type")}
+        return {"type": "auto"}
+
+    @staticmethod
+    def _convert_tool_choice_to_openai(tool_choice: Any) -> Any:
+        if isinstance(tool_choice, dict):
+            if tool_choice.get("type") == "tool" and tool_choice.get("name"):
+                return {"type": "function", "function": {"name": tool_choice.get("name")}}
+            if tool_choice.get("type") in ("auto", "any"):
+                return "auto"
+        if isinstance(tool_choice, str):
+            return tool_choice
+        return "auto"
+
+    @staticmethod
+    def _convert_tool_choice_to_gemini_tool_config(tool_choice: Any) -> Optional[dict]:
+        if isinstance(tool_choice, str):
+            if tool_choice == "none":
+                return {"functionCallingConfig": {"mode": "NONE"}}
+            if tool_choice == "required":
+                return {"functionCallingConfig": {"mode": "ANY"}}
+            return {"functionCallingConfig": {"mode": "AUTO"}}
+        if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+            name = tool_choice.get("function", {}).get("name")
+            if name:
+                return {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [name]}}
+        return None
+
+    @staticmethod
+    def _gemini_tool_config_to_openai(tool_config: dict) -> Any:
+        mode = (tool_config or {}).get("functionCallingConfig", {}).get("mode", "AUTO")
+        if mode == "NONE":
+            return "none"
+        if mode == "ANY":
+            allowed = (tool_config or {}).get("functionCallingConfig", {}).get("allowedFunctionNames", [])
+            if allowed:
+                return {"type": "function", "function": {"name": allowed[0]}}
+            return "required"
+        return "auto"
+
+    @staticmethod
+    def _normalize_finish_reason(value: Optional[str]) -> str:
+        if value is None:
+            return "stop"
+        normalized = str(value).lower()
+        if normalized in ("end_turn", "stop", "stopped", "finish", "finished"):
+            return "stop"
+        if normalized in ("max_tokens", "length", "token_limit", "max_output_tokens"):
+            return "length"
+        if normalized in ("tool_use", "tool_calls", "function_call"):
+            return "tool_calls"
+        return normalized
+
+    @staticmethod
+    def _openai_finish_to_claude(value: Optional[str]) -> str:
+        normalized = OpenAIProxy._normalize_finish_reason(value)
+        if normalized == "length":
+            return "max_tokens"
+        if normalized == "tool_calls":
+            return "tool_use"
+        return "end_turn"
+
+    @staticmethod
+    def _openai_finish_to_gemini(value: Optional[str]) -> str:
+        normalized = OpenAIProxy._normalize_finish_reason(value)
+        if normalized == "length":
+            return "MAX_TOKENS"
+        return "STOP"
+
+    @staticmethod
+    def _passthrough_fields(source: dict, excluded: set) -> dict:
+        return {k: v for k, v in source.items() if k not in excluded}
+
+    @staticmethod
+    def _json_response(body: dict, status_code: int = 200) -> Response:
+        return Response(json.dumps(body), status=status_code, content_type="application/json")
+
+    @staticmethod
+    def _is_direct_stream_compatible(client_format: str, provider_format: str) -> bool:
+        return (
+            (client_format == CLIENT_FORMAT_OPENAI and provider_format == PROVIDER_FORMAT_OPENAI)
+            or (client_format == CLIENT_FORMAT_CLAUDE and provider_format == PROVIDER_FORMAT_CLAUDE)
+            or (client_format == CLIENT_FORMAT_GEMINI and provider_format == PROVIDER_FORMAT_GEMINI)
+        )
+
     @staticmethod
     def _error_response(status_code: int, message: str) -> Response:
-        """生成错误响应"""
-        error_body = {
-            "error": {
-                "message": message,
-                "type": "api_error",
-                "code": status_code
-            }
-        }
-        return Response(
-            json.dumps(error_body),
-            status=status_code,
-            content_type="application/json"
-        )
-    
+        return Response(json.dumps({"error": {"message": message, "type": "api_error", "code": status_code}}), status=status_code, content_type="application/json")
+
     def _normalize_request_body(self, body: dict) -> dict:
-        """
-        宽容处理对结果影响较小的参数格式，减少上游 400。
-        当前规则：
-        - stop: 兼容 null/字符串/数组；不限制数组长度；单元素数组转字符串；无效值移除
-        """
         normalized = body.copy()
-        
         if "stop" in normalized:
             normalized_stop = self._normalize_stop(normalized.get("stop"))
             if normalized_stop is None:
                 normalized.pop("stop", None)
             else:
                 normalized["stop"] = normalized_stop
-        
         return normalized
-    
+
     @staticmethod
     def _normalize_stop(stop_value: Any) -> Optional[Any]:
-        """宽容解析 stop 字段。"""
         if stop_value is None:
             return None
-        
         if isinstance(stop_value, str):
             return stop_value
-        
         if isinstance(stop_value, (list, tuple, set)):
             stops = [item for item in stop_value if isinstance(item, str)]
             if not stops:
@@ -513,5 +1558,4 @@ class OpenAIProxy:
             if len(stops) == 1:
                 return stops[0]
             return stops
-        
         return None

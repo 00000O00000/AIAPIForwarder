@@ -4,6 +4,7 @@
 
 import logging
 from datetime import datetime
+from typing import Set
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from croniter import croniter
@@ -20,16 +21,22 @@ class UsageResetScheduler:
         self.config_manager = config_manager
         self.usage_manager = usage_manager
         self.scheduler = BackgroundScheduler()
-        self._jobs = {}
+        self._jobs: Set[str] = set()
     
     def start(self):
         """启动调度器"""
+        if self.scheduler.running:
+            logger.info("Usage reset scheduler already running")
+            return
         self._setup_jobs()
         self.scheduler.start()
         logger.info("Usage reset scheduler started")
     
     def stop(self):
         """停止调度器"""
+        if not self.scheduler.running:
+            logger.info("Usage reset scheduler already stopped")
+            return
         self.scheduler.shutdown()
         logger.info("Usage reset scheduler stopped")
     
@@ -44,9 +51,13 @@ class UsageResetScheduler:
     def _add_reset_job(self, model_name: str, provider_name: str, cron_expr: str):
         """添加重置任务"""
         job_id = f"reset_{model_name}_{provider_name}"
+        cron_expr = (cron_expr or "").strip()
         
         try:
             # 解析 cron 表达式
+            if not croniter.is_valid(cron_expr):
+                logger.error(f"Invalid cron expression: {cron_expr}")
+                return
             parts = cron_expr.split()
             if len(parts) != 5:
                 logger.error(f"Invalid cron expression: {cron_expr}")
@@ -69,7 +80,7 @@ class UsageResetScheduler:
                 id=job_id,
                 replace_existing=True
             )
-            self._jobs[job_id] = True
+            self._jobs.add(job_id)
             
             # 计算下次执行时间
             cron = croniter(cron_expr, datetime.now())
@@ -88,15 +99,16 @@ class UsageResetScheduler:
     
     def reload(self):
         """重新加载定时任务"""
-        # 移除所有已注册的定时任务
-        for job_id in list(self._jobs.keys()):
+        self._clear_jobs()
+        self._setup_jobs()
+        logger.info(f"Scheduler reloaded, {len(self._jobs)} jobs configured")
+
+    def _clear_jobs(self):
+        """移除所有已注册的定时任务"""
+        for job_id in list(self._jobs):
             try:
                 self.scheduler.remove_job(job_id)
                 logger.debug(f"Removed job: {job_id}")
             except Exception:
                 pass
         self._jobs.clear()
-        
-        # 重新设置任务
-        self._setup_jobs()
-        logger.info(f"Scheduler reloaded, {len(self._jobs)} jobs configured")

@@ -24,9 +24,9 @@ class ProviderManager:
         """获取所有可用模型"""
         return self.config_manager.get_all_models()
     
-    def select_provider(self, model_name: str, 
-                       exclude_providers: List[str] = None,
-                       require_stream: bool = None) -> Optional[ProviderConfig]:
+    def select_provider(self, model_name: str,
+                       exclude_providers: Optional[List[str]] = None,
+                       require_stream: Optional[bool] = None) -> Optional[ProviderConfig]:
         """
         选择一个可用的提供商
         
@@ -38,7 +38,7 @@ class ProviderManager:
         Returns:
             选中的提供商配置，如果没有可用的则返回 None
         """
-        exclude_providers = exclude_providers or []
+        exclude_providers = set(exclude_providers or [])
         providers = self.config_manager.get_providers(model_name)
         
         if not providers:
@@ -84,19 +84,17 @@ class ProviderManager:
     
     def _weighted_random_choice(self, providers: List[ProviderConfig]) -> ProviderConfig:
         """根据权重随机选择"""
+        if not providers:
+            raise ValueError("providers must not be empty")
         if len(providers) == 1:
             return providers[0]
-        
-        total_weight = sum(p.weight for p in providers)
-        r = random.uniform(0, total_weight)
-        
-        current = 0
-        for provider in providers:
-            current += provider.weight
-            if r <= current:
-                return provider
-        
-        return providers[-1]
+
+        weights = [max(0, p.weight) for p in providers]
+        total_weight = sum(weights)
+        if total_weight <= 0:
+            return random.choice(providers)
+
+        return random.choices(providers, weights=weights, k=1)[0]
     
     def get_provider_by_name(self, model_name: str, 
                              provider_name: str) -> Optional[ProviderConfig]:
@@ -130,4 +128,6 @@ class ProviderManager:
             if p.priority not in groups:
                 groups[p.priority] = []
             groups[p.priority].append(p)
+        for priority in groups:
+            groups[priority].sort(key=lambda item: item.weight, reverse=True)
         return groups

@@ -49,13 +49,25 @@ class RateLimiter:
     def record_usage(self, model_name: str, provider_name: str,
                      requests: int = 1, tokens: int = 0):
         """记录使用量"""
+        try:
+            safe_requests = max(0, int(requests))
+        except (TypeError, ValueError):
+            safe_requests = 0
+        try:
+            safe_tokens = max(0, int(tokens))
+        except (TypeError, ValueError):
+            safe_tokens = 0
+
+        if safe_requests == 0 and safe_tokens == 0:
+            return
+
         self.usage_manager.update_usage(
             model_name, provider_name,
-            requests_delta=requests,
-            tokens_delta=tokens
+            requests_delta=safe_requests,
+            tokens_delta=safe_tokens
         )
         logger.debug(f"Recorded usage for {model_name}/{provider_name}: "
-                    f"requests={requests}, tokens={tokens}")
+                    f"requests={safe_requests}, tokens={safe_tokens}")
     
     def get_usage_stats(self, model_name: str, provider_name: str) -> dict:
         """获取使用统计"""

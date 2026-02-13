@@ -71,6 +71,7 @@ cd ai-api-gateway
         "endpoint": "https://api.example.com/v1",
         "api_key": "sk-your-api-key",
         "model": "gpt-4o",
+        "format": "openai",
         "priority": 1,
         "weight": 10,
         "rate_limit": {
@@ -148,6 +149,12 @@ ai-api-gateway/
 | `log_requests` | bool | true | 是否记录请求日志 |
 | `api_key` | string | "" | 网关认证密钥（留空则不验证） |
 
+> 网关启用 `api_key` 后，客户端可通过以下任一方式鉴权：
+> - `Authorization: Bearer <gateway_api_key>`
+> - `x-api-key: <gateway_api_key>`
+> - `x-goog-api-key: <gateway_api_key>`
+> - 查询参数 `?key=<gateway_api_key>`
+
 ### 模型配置
 
 每个模型（如 `gpt-4o`、`deepseek-chat`）包含一个 `providers` 数组：
@@ -158,6 +165,7 @@ ai-api-gateway/
 | `endpoint` | string | ✅ | - | API 端点 URL |
 | `api_key` | string | ✅ | - | 提供商 API 密钥 |
 | `model` | string | ✅ | - | 上游实际模型名 |
+| `format` | string | ❌ | openai | 上游协议格式：`openai` / `openai-response` / `claude` / `gemini` |
 | `priority` | int | ❌ | 1 | 优先级（越小越优先） |
 | `weight` | int | ❌ | 10 | 同优先级轮询权重 |
 | `rate_limit` | object | ❌ | null | 限额配置 |
@@ -192,6 +200,17 @@ ai-api-gateway/
 
 ## 📡 API 文档
 
+### 调用格式兼容说明
+
+- 客户端格式自动适配：
+  - 当请求体是 Claude Messages 或 Gemini generateContent 格式时，网关会自动识别并转换为内部统一格式转发。
+  - 响应会按客户端原始协议格式返回（OpenAI / Claude / Gemini）。
+- 提供商格式主动适配：
+  - 每个 provider 可通过 `format` 指定上游协议：`openai` / `openai-response` / `claude` / `gemini`。
+  - 网关会在调用上游时自动完成请求和响应的双向转换。
+- 参数保留策略：
+  - 进行格式转化时尽量保留所有可映射参数；无法一一映射的字段会尽量透传，避免能力丢失。
+
 ### OpenAI 兼容接口
 
 | 端点 | 方法 | 说明 |
@@ -201,14 +220,24 @@ ai-api-gateway/
 | `/v1/completions` | POST | Text Completion |
 | `/v1/embeddings` | POST | 文本向量化 |
 
+### Claude / Gemini 兼容接口
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/v1/messages` | POST | Claude Messages 兼容接口 |
+| `/v1beta/models/<model>:generateContent` | POST | Gemini 非流式接口 |
+| `/v1beta/models/<model>:streamGenerateContent` | POST | Gemini 流式接口 |
+| `/v1/models/<model>:generateContent` | POST | Gemini 非流式接口（v1 路由） |
+| `/v1/models/<model>:streamGenerateContent` | POST | Gemini 流式接口（v1 路由） |
+
 ### 管理接口
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/health` | GET | 健康检查 |
-| `/admin/stats` | GET | 获取使用统计 |
-| `/admin/reload` | POST | 热重载配置 |
-| `/admin/providers/<model>` | GET | 获取模型提供商状态 |
+| `/admin/stats` | GET | 获取使用统计（需网关鉴权） |
+| `/admin/reload` | POST | 热重载配置（需网关鉴权） |
+| `/admin/providers/<model>` | GET | 获取模型提供商状态（需网关鉴权） |
 
 ### 请求示例
 
@@ -262,7 +291,8 @@ curl http://localhost:6010/v1/chat/completions \
 #### 查看使用统计
 
 ```bash
-curl http://localhost:6010/admin/stats
+curl http://localhost:6010/admin/stats \
+  -H "Authorization: Bearer your-gateway-key"
 ```
 
 响应：
@@ -283,7 +313,37 @@ curl http://localhost:6010/admin/stats
 #### 热重载配置
 
 ```bash
-curl -X POST http://localhost:6010/admin/reload
+curl -X POST http://localhost:6010/admin/reload \
+  -H "Authorization: Bearer your-gateway-key"
+```
+
+#### Claude Messages 示例
+
+```bash
+curl http://localhost:6010/v1/messages \
+  -H "Authorization: Bearer your-gateway-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o",
+    "max_tokens": 256,
+    "messages": [
+      {"role": "user", "content": [{"type": "text", "text": "Hello from Claude format"}]}
+    ]
+  }'
+```
+
+#### Gemini generateContent 示例
+
+```bash
+curl http://localhost:6010/v1beta/models/gpt-4o:generateContent \
+  -H "Authorization: Bearer your-gateway-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": [
+      {"role": "user", "parts": [{"text": "Hello from Gemini format"}]}
+    ],
+    "generationConfig": {"temperature": 0.7}
+  }'
 ```
 
 ## 🔧 高级配置
@@ -295,6 +355,9 @@ curl -X POST http://localhost:6010/admin/reload
 | `TZ` | UTC | 时区设置 |
 | `LOG_LEVEL` | INFO | 日志级别 (DEBUG/INFO/WARNING/ERROR) |
 | `FLASK_ENV` | production | Flask 运行环境 |
+| `CONFIG_PATH` | `/app/config/provider.json` | 主配置文件路径（本地开发可指向 `config/provider.json`） |
+| `USAGE_DATA_DIR` | `/app/data/usage` | 使用量持久化目录 |
+| `ENABLE_SCHEDULER` | `true` | 是否启用限额重置调度器 |
 
 ### Docker Compose 配置
 
@@ -454,27 +517,6 @@ curl -X POST http://localhost:6010/admin/reload
 tar -czvf backup-$(date +%Y%m%d).tar.gz data/ logs/
 ```
 
-## 📝 更新日志
-
-### v1.0.0 (2024-01-15)
-- 🎉 首次发布
-- ✅ 多提供商支持
-- ✅ 优先级 + 权重负载均衡
-- ✅ 限额管理与自动刷新
-- ✅ 故障自动转移
-- ✅ 流式/非流式自动转换
-- ✅ 热重载配置
-- ✅ 使用统计接口
-
-## 🤝 贡献指南
-
-欢迎提交 Issue 和 Pull Request！
-
-1. Fork 本仓库
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 开启 Pull Request
 
 ## 📄 许可证
 
