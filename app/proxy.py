@@ -29,6 +29,7 @@ from .format_converter import (
 from .models import ProviderConfig
 from .provider_manager import ProviderManager
 from .stream_handler import StreamHandler
+from .toolcall2mcp import inject_toolcall_prompt, apply_toolcall_to_openai_response
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +246,15 @@ class OpenAIProxy:
         elif need_convert_non_stream:
             upstream_body["stream"] = True
 
+        # --- toolcall2mcp 请求预处理 ---
+        use_toolcall2mcp = (
+            provider.toolcall2mcp_support
+            and endpoint == "/chat/completions"
+            and upstream_body.get("tools")
+        )
+        if use_toolcall2mcp:
+            upstream_body = inject_toolcall_prompt(upstream_body)
+
         try:
             response, status_code, tokens = self._send_request(
                 provider=provider,
@@ -255,6 +265,7 @@ class OpenAIProxy:
                 need_convert_non_stream=need_convert_non_stream,
                 model_name=model_name,
                 client_format=client_format,
+                use_toolcall2mcp=use_toolcall2mcp,
             )
             if 200 <= status_code < 300:
                 self.provider_manager.record_success(model_name, provider.name, tokens)
@@ -284,6 +295,7 @@ class OpenAIProxy:
         need_convert_non_stream: bool,
         model_name: Optional[str],
         client_format: str,
+        use_toolcall2mcp: bool = False,
     ) -> Tuple[Response, int, int]:
         provider_format = provider.format
         upstream_body, upstream_endpoint = self._build_upstream_request(provider, body, endpoint, is_stream)
@@ -300,6 +312,7 @@ class OpenAIProxy:
                 provider_name=provider.name,
                 provider_format=provider_format,
                 client_format=client_format,
+                use_toolcall2mcp=use_toolcall2mcp,
             )
         if need_convert_non_stream:
             return self._convert_to_non_stream(
@@ -309,6 +322,7 @@ class OpenAIProxy:
                 client_format=client_format,
                 provider_format=provider_format,
                 model_name=body.get("model"),
+                use_toolcall2mcp=use_toolcall2mcp,
             )
 
         with httpx.Client(timeout=provider.timeout) as client:
@@ -342,6 +356,10 @@ class OpenAIProxy:
         openai_data = self._converter.provider_response_to_openai(provider_data, provider_format, body.get("model"))
         tokens = self._converter.extract_tokens_from_provider_response(provider_data, provider_format, openai_data)
 
+        # --- toolcall2mcp 非流式响应后处理 ---
+        if use_toolcall2mcp:
+            openai_data = apply_toolcall_to_openai_response(openai_data)
+
         if need_convert_stream:
             return self._convert_to_stream(openai_data, client_format), 200, tokens
 
@@ -362,6 +380,7 @@ class OpenAIProxy:
         provider_name: Optional[str],
         provider_format: str,
         client_format: str,
+        use_toolcall2mcp: bool = False,
     ) -> Tuple[Response, int, int]:
         client = httpx.Client(timeout=timeout)
         try:
@@ -374,7 +393,8 @@ class OpenAIProxy:
                 return Response(error_body, status=upstream_response.status_code, content_type="application/json"), upstream_response.status_code, 0
 
             provider_mgr = self.provider_manager
-            direct = self._is_direct_stream_compatible(client_format, provider_format)
+            # toolcall2mcp 启用时，不能直传——需要收集内容后解析 <tooluse-special>
+            direct = self._is_direct_stream_compatible(client_format, provider_format) and not use_toolcall2mcp
             stream_handler = self._stream
 
             def generate():
@@ -396,7 +416,8 @@ class OpenAIProxy:
                         return
 
                     # --- Responses API 流式：逐 chunk 实时透传（对齐 CCR） ---
-                    if provider_format == PROVIDER_FORMAT_OPENAI_RESPONSE:
+                    # toolcall2mcp 启用时不走直传——需要收集完整内容后解析 <tooluse-special>
+                    if provider_format == PROVIDER_FORMAT_OPENAI_RESPONSE and not use_toolcall2mcp:
                         index_state: Dict[str, Any] = {"current_index": -1, "last_event_type": ""}
                         stream_ended = False
                         for line in upstream_response.iter_lines():
@@ -501,6 +522,9 @@ class OpenAIProxy:
                     if thinking_content or thinking_signature:
                         meta["_thinking"] = {"content": thinking_content, "signature": thinking_signature}
                     openai_data = stream_handler.build_openai_response_from_stream_content(text_buffer, finish_reason, usage, meta)
+                    # --- toolcall2mcp 流式响应后处理 ---
+                    if use_toolcall2mcp:
+                        openai_data = apply_toolcall_to_openai_response(openai_data)
                     # iter_stream_payload 内部按 client_format 做格式转换，直接传 openai 格式数据
                     for item in stream_handler.iter_stream_payload(openai_data, client_format):
                         yield item.encode("utf-8")
@@ -537,6 +561,7 @@ class OpenAIProxy:
         client_format: str,
         provider_format: str,
         model_name: Optional[str],
+        use_toolcall2mcp: bool = False,
     ) -> Tuple[Response, int, int]:
         url = self._build_upstream_url(provider.endpoint, endpoint, provider_format, is_stream=True)
         headers = self._build_headers(provider)
@@ -585,6 +610,9 @@ class OpenAIProxy:
                             }
 
                         usage = openai_data.get("usage", {})
+                        # --- toolcall2mcp 流转非流响应后处理（Responses API 分支）---
+                        if use_toolcall2mcp:
+                            openai_data = apply_toolcall_to_openai_response(openai_data)
                         client_data = self._converter.convert_openai_response_to_client(openai_data, client_format)
                         return self._json_response(client_data), 200, usage.get("total_tokens", 0)
 
@@ -666,6 +694,9 @@ class OpenAIProxy:
             if thinking_content or thinking_signature:
                 meta["_thinking"] = {"content": thinking_content, "signature": thinking_signature}
             openai_data = self._stream.build_openai_response_from_stream_content(content, finish_reason, usage, meta)
+            # --- toolcall2mcp 流转非流响应后处理 ---
+            if use_toolcall2mcp:
+                openai_data = apply_toolcall_to_openai_response(openai_data)
             client_data = self._converter.convert_openai_response_to_client(openai_data, client_format)
             return self._json_response(client_data), 200, usage.get("total_tokens", 0)
         except Exception as exc:

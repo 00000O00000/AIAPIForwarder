@@ -25,4 +25,4 @@ ENV PYTHONPATH=/app
 
 EXPOSE 6010
 
-CMD ["gunicorn", "--bind", "0.0.0.0:6010", "--workers", "4", "--threads", "2", "--timeout", "120", "app.main:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:6010", "--workers", "1", "--threads", "8", "--timeout", "120", "app.main:app"]

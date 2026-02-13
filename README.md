@@ -5,8 +5,10 @@
 - 自动重试与故障切换
 - OpenAI / Claude / Gemini 请求格式兼容
 - 上游协议格式自动转换（`openai` / `openai-response` / `claude` / `gemini`）
+- Claude Code 原生支持（`openai-response` 格式，对齐 CCR 转换逻辑）
 - Provider 限额与周期重置
 - Provider 级并发上限（`rate_limit.max_worker`）
+- ToolCall2MCP：为不支持原生 tool_call 的逆向 API 提供提示词注入式工具调用
 
 ## 快速开始
 
@@ -120,6 +122,7 @@ flowchart TD
 - `enabled`: 是否启用
 - `custom_headers`: 自定义请求头
 - `max_context_length`: 最大上下文长度（预留）
+- `toolcall2mcp_support`: 是否启用 ToolCall2MCP（见下方说明）
 
 ### `rate_limit`
 - `requests_per_period`: 周期内请求上限
@@ -144,6 +147,61 @@ flowchart TD
 - 若排队请求数超过 `（该优先级所有 provider 的 max_worker 总和）* queue_overflow_factor`，后续请求会自动转移到下一优先级。
 - 排队上限按 `floor(总max_worker * queue_overflow_factor)` 计算，确保语义是“超过阈值才转移”。
 
+## Claude Code 支持
+
+本网关原生支持 Claude Code 使用的 `openai-response` 格式（OpenAI Responses API），转换逻辑对齐 [Claude Code Router (CCR)](https://github.com/nicekid1/claude-code-router)。
+
+### 工作原理
+
+当 Provider 的 `format` 设为 `openai-response` 时，网关自动完成以下转换：
+
+| 方向 | 转换内容 |
+|------|----------|
+| 请求 | `messages` → `input`、`tools` → Responses API 扁平结构、`reasoning` 参数透传、删除 `temperature` |
+| 非流式响应 | `output[]` → `choices[].message`（含 `tool_calls`、`thinking`、`annotations`） |
+| 流式响应 | Responses API SSE 事件逐 chunk 实时转换为 OpenAI Chat Completion Chunk 格式 |
+
+### 配置示例
+
+```json
+{
+  "name": "openai-responses",
+  "endpoint": "https://api.openai.com/v1",
+  "api_key": "sk-xxx",
+  "model": "gpt-4o",
+  "format": "openai-response",
+  "priority": 1,
+  "weight": 10
+}
+```
+
+## ToolCall2MCP
+
+为不支持原生 `tool_call` 的逆向 API（如某些第三方代理）提供基于提示词注入的工具调用能力。
+
+### 工作原理
+
+1. **请求预处理**：将 `tools` 定义编译为系统提示词注入 `messages`，将历史消息中的 `tool_calls` / `tool` 消息转为纯文本，剥离 `tools` 和 `tool_choice` 字段
+2. **AI 回复**：模型按提示词约定输出 `<tooluse-special>` XML 标签包裹的 JSON 工具调用
+3. **响应后处理**：网关解析 `<tooluse-special>` 标签，将其转码为标准 OpenAI `tool_calls` 格式
+
+### 配置
+
+在 Provider 配置中设置 `"toolcall2mcp_support": true`：
+
+```json
+{
+  "name": "reverse-api",
+  "endpoint": "https://example.com/v1",
+  "api_key": "xxx",
+  "model": "some-model",
+  "format": "openai",
+  "toolcall2mcp_support": true
+}
+```
+
+> **注意**：启用 `toolcall2mcp_support` 后，流式请求不会直传，需要收集完整内容后解析工具调用标签。
+
 ## API 路由
 
 ### OpenAI 兼容
@@ -154,6 +212,7 @@ flowchart TD
 
 ### Claude 兼容
 - `POST /v1/messages`
+- `POST /v1/messages/count_tokens`
 
 ### Gemini 兼容
 - `POST /v1beta/models/<model>:generateContent`
@@ -173,9 +232,10 @@ flowchart TD
 - `USAGE_DATA_DIR`（默认 `/app/data/usage`）
 - `ENABLE_SCHEDULER`（默认 `true`）
 - `LOG_LEVEL`（默认 `INFO`）
+- `FLASK_DEBUG`（默认 `false`）
 - `TZ`
 
 ## 说明
 
-- 多实例部署时，`max_worker` 是进程内并发；若要全局并发，建议加外部协调（Redis/网关限流层）。
+- 默认以单进程多线程模式运行（`gunicorn --workers 1`），`max_worker` 并发控制在进程内有效。若需多 worker 或多实例部署，`max_worker` 为进程级并发，需加外部协调（Redis/网关限流层）来实现全局并发控制。
 - 使用反向代理时，请关闭 SSE 缓冲。

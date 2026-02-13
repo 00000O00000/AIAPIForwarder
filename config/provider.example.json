@@ -30,7 +30,8 @@
         "custom_headers": {
           "X-Project": "gateway-demo"
         },
-        "max_context_length": 128000
+        "max_context_length": 128000,
+        "toolcall2mcp_support": false
       },
       {
         "name": "openai-responses-backup",
@@ -52,7 +53,8 @@
         "non_stream_support": true,
         "enabled": true,
         "custom_headers": null,
-        "max_context_length": 128000
+        "max_context_length": 128000,
+        "toolcall2mcp_support": false
       }
     ]
   },
@@ -80,7 +82,8 @@
         "custom_headers": {
           "anthropic-version": "2023-06-01"
         },
-        "max_context_length": 200000
+        "max_context_length": 200000,
+        "toolcall2mcp_support": false
       }
     ]
   },
@@ -106,7 +109,8 @@
         "non_stream_support": true,
         "enabled": true,
         "custom_headers": null,
-        "max_context_length": 1048576
+        "max_context_length": 1048576,
+        "toolcall2mcp_support": false
       }
     ]
   },
@@ -132,7 +136,8 @@
         "non_stream_support": true,
         "enabled": true,
         "custom_headers": null,
-        "max_context_length": null
+        "max_context_length": null,
+        "toolcall2mcp_support": false
       }
     ]
   }

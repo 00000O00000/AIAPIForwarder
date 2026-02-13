@@ -947,10 +947,38 @@ class FormatConverter:
         usage = openai_data.get("usage", {})
         candidates = []
         for choice in openai_data.get("choices", []):
-            text = cu.openai_content_to_text(choice.get("message", {}).get("content", ""))
+            message = choice.get("message", {})
+            text = cu.openai_content_to_text(message.get("content", ""))
+            parts: List[dict] = []
+            if text:
+                parts.append({"text": text})
+
+            # 将 tool_calls 转为 Gemini functionCall parts
+            for tool_call in cu.safe_list(message.get("tool_calls")):
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function", {})
+                raw_arguments = function.get("arguments", "{}")
+                if isinstance(raw_arguments, str):
+                    try:
+                        parsed_args = json.loads(raw_arguments)
+                    except Exception:
+                        parsed_args = {"raw": raw_arguments}
+                else:
+                    parsed_args = raw_arguments
+                parts.append({
+                    "functionCall": {
+                        "name": function.get("name", ""),
+                        "args": parsed_args,
+                    }
+                })
+
+            if not parts:
+                parts.append({"text": ""})
+
             candidates.append({
                 "index": choice.get("index", 0),
-                "content": {"role": "model", "parts": [{"text": text}]},
+                "content": {"role": "model", "parts": parts},
                 "finishReason": cu.openai_finish_to_gemini(choice.get("finish_reason")),
             })
         return {

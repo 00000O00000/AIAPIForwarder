@@ -11,7 +11,7 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - LOG_LEVEL=INFO
-      - FLASK_ENV=production
+      - FLASK_DEBUG=false
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:6010/health"]
