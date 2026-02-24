@@ -4,7 +4,7 @@
     "default_retry": 3,
     "queue_overflow_factor": 2.0,
     "log_requests": true,
-    "api_key": "replace-with-your-gateway-api-key"
+    "api_key": " replace-with-your-gateway-api-key "
   },
   "gpt-4o": {
     "providers": [
