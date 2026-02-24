@@ -13,7 +13,6 @@ from .format_converter import (
     CLIENT_FORMAT_GEMINI,
     PROVIDER_FORMAT_CLAUDE,
     PROVIDER_FORMAT_GEMINI,
-    PROVIDER_FORMAT_OPENAI_RESPONSE,
 )
 
 
@@ -78,51 +77,6 @@ class StreamHandler:
                 }
             if chunk.get("modelVersion"):
                 meta["model"] = chunk.get("modelVersion")
-            return text_delta, finish_reason, usage, meta
-
-        # Responses API 格式（openai-response）：事件类型在 data.type 中
-        if provider_format == PROVIDER_FORMAT_OPENAI_RESPONSE:
-            event_type = chunk.get("type", "")
-
-            if event_type == "response.output_text.delta":
-                text_delta = chunk.get("delta", "")
-            elif event_type == "response.completed":
-                resp = chunk.get("response", {})
-                has_func = any(
-                    isinstance(o, dict) and o.get("type") == "function_call"
-                    for o in cu.safe_list(resp.get("output"))
-                )
-                finish_reason = "tool_calls" if has_func else "stop"
-                resp_usage = resp.get("usage", {})
-                if resp_usage:
-                    usage = {
-                        "prompt_tokens": resp_usage.get("input_tokens", 0),
-                        "completion_tokens": resp_usage.get("output_tokens", 0),
-                        "total_tokens": resp_usage.get("total_tokens", 0),
-                    }
-                meta["id"] = resp.get("id", "")
-                meta["model"] = resp.get("model", "")
-            elif event_type == "response.output_item.added":
-                item = chunk.get("item", {})
-                if item.get("type") == "function_call":
-                    call_id = item.get("call_id") or item.get("id", "")
-                    meta["_tool_calls_delta"] = [{
-                        "index": 0,
-                        "id": call_id,
-                        "function": {"name": item.get("name", ""), "arguments": ""},
-                        "type": "function",
-                    }]
-            elif event_type == "response.function_call_arguments.delta":
-                meta["_tool_calls_delta"] = [{
-                    "index": 0,
-                    "function": {"arguments": chunk.get("delta", "")},
-                }]
-            elif event_type == "response.reasoning_summary_text.delta":
-                meta["_thinking_delta"] = {"content": chunk.get("delta", "")}
-            elif event_type == "response.reasoning_summary_part.done":
-                if chunk.get("part"):
-                    meta["_thinking_delta"] = {"signature": chunk.get("item_id", "")}
-
             return text_delta, finish_reason, usage, meta
 
         # OpenAI 格式
@@ -296,35 +250,12 @@ class StreamHandler:
         """生成 Gemini 格式的 SSE 流。"""
         usage = response_data.get("usage", {})
         for choice in response_data.get("choices", []):
-            message = choice.get("message", {})
-            text = cu.openai_content_to_text(message.get("content", ""))
-            parts: list = []
-            if text:
-                parts.append({"text": text})
-
-            # 将 tool_calls 转为 Gemini functionCall parts
-            for tc in cu.safe_list(message.get("tool_calls")):
-                if not isinstance(tc, dict):
-                    continue
-                function = tc.get("function", {})
-                raw_args = function.get("arguments", "{}")
-                if isinstance(raw_args, str):
-                    try:
-                        parsed_args = json.loads(raw_args)
-                    except Exception:
-                        parsed_args = {"raw": raw_args}
-                else:
-                    parsed_args = raw_args
-                parts.append({"functionCall": {"name": function.get("name", ""), "args": parsed_args}})
-
-            if not parts:
-                parts.append({"text": ""})
-
+            text = cu.openai_content_to_text(choice.get("message", {}).get("content", ""))
             chunk = {
                 "candidates": [
                     {
                         "index": choice.get("index", 0),
-                        "content": {"role": "model", "parts": parts},
+                        "content": {"role": "model", "parts": [{"text": text}]},
                         "finishReason": cu.openai_finish_to_gemini(choice.get("finish_reason")),
                     }
                 ],
@@ -340,16 +271,6 @@ class StreamHandler:
     def _iter_openai_stream(self, response_data: dict) -> Iterable[str]:
         """生成 OpenAI 格式的 SSE 流。"""
         for choice in response_data.get("choices", []):
-            message = choice.get("message", {})
-            delta: dict = {
-                "role": "assistant",
-                "content": cu.openai_content_to_text(message.get("content", "")),
-            }
-            # 将 tool_calls 包含在 delta 中
-            tool_calls = cu.safe_list(message.get("tool_calls"))
-            if tool_calls:
-                delta["tool_calls"] = tool_calls
-
             chunk = {
                 "id": response_data.get("id", ""),
                 "object": "chat.completion.chunk",
@@ -358,7 +279,10 @@ class StreamHandler:
                 "choices": [
                     {
                         "index": choice.get("index", 0),
-                        "delta": delta,
+                        "delta": {
+                            "role": "assistant",
+                            "content": cu.openai_content_to_text(choice.get("message", {}).get("content", "")),
+                        },
                         "finish_reason": choice.get("finish_reason"),
                     }
                 ],

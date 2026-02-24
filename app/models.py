@@ -40,7 +40,6 @@ class ProviderConfig(BaseModel):
     enabled: bool = True
     custom_headers: Optional[Dict[str, str]] = None
     max_context_length: Optional[int] = Field(default=None, ge=1)
-    toolcall2mcp_support: bool = False
 
     @field_validator("name", "endpoint", "model", mode="before")
     @classmethod

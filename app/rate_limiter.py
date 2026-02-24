@@ -82,7 +82,6 @@ class RateLimiter:
                 "requests_limit": None,
                 "tokens_limit": None,
                 "max_worker_limit": None,
-                "last_reset": usage.last_reset,
             }
 
         return {

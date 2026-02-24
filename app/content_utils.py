@@ -286,10 +286,8 @@ def gemini_tools_to_openai_tools(tools: List[dict]) -> List[dict]:
 def convert_tool_choice_to_claude(tool_choice: Any) -> Any:
     """将 OpenAI tool_choice 转换为 Claude tool_choice。"""
     if isinstance(tool_choice, str):
-        if tool_choice in ("auto", "any"):
-            return {"type": "auto" if tool_choice == "auto" else "any"}
-        if tool_choice == "none":
-            return {"type": "none"}
+        if tool_choice in ("auto", "none", "any"):
+            return {"type": "auto" if tool_choice in ("auto", "none") else "any"}
         return {"type": "tool", "name": tool_choice}
     if isinstance(tool_choice, dict):
         if tool_choice.get("type") == "function":
