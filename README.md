@@ -11,7 +11,7 @@
 轻量级 AI 接口网关，支持：
 - 多提供商自动调度（优先级 + 权重）
 - 自动重试与故障切换
-- OpenAI / OpenAI-Resopnse / Claude / Gemini 多请求格式兼容
+- OpenAI / OpenAI-Response / Claude / Gemini 多请求格式兼容
 - 上游协议格式自动转换（`openai` / `openai-response` / `claude` / `gemini`）
 - Provider 限额与周期重置
 - 并发上限与自动调度（`rate_limit.max_worker`）
