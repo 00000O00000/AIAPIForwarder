@@ -270,8 +270,10 @@ class OpenAIProxy:
     def _classify_error(status_code: int) -> str:
         if status_code == 400:
             return "client_error"
-        if status_code in (401, 403, 429):
+        if status_code in (401, 403):
             return "auth_error"
+        if status_code == 429:
+            return "rate_limited"
         return "server_error"
 
     def _send_request(
@@ -398,7 +400,6 @@ class OpenAIProxy:
                     # --- Responses API 流式：逐 chunk 实时透传（对齐 CCR） ---
                     if provider_format == PROVIDER_FORMAT_OPENAI_RESPONSE:
                         index_state: Dict[str, Any] = {"current_index": -1, "last_event_type": ""}
-                        stream_ended = False
                         for line in upstream_response.iter_lines():
                             if line is None:
                                 continue
@@ -430,7 +431,6 @@ class OpenAIProxy:
                                             "completion_tokens": resp_usage.get("output_tokens", 0),
                                             "total_tokens": resp_usage.get("total_tokens", 0),
                                         }
-                                    stream_ended = True
 
                                 yield sse_line.encode("utf-8")
 
@@ -466,32 +466,10 @@ class OpenAIProxy:
                         if usage_update:
                             usage.update(usage_update)
                         if meta_update:
-                            # 提取并合并 tool_calls 增量数据
-                            tc_deltas = meta_update.pop("_tool_calls_delta", None)
-                            if tc_deltas:
-                                for tc in tc_deltas:
-                                    idx = tc.get("index", 0)
-                                    if idx not in collected_tool_calls:
-                                        collected_tool_calls[idx] = {
-                                            "id": tc.get("id", ""),
-                                            "type": "function",
-                                            "function": {"name": "", "arguments": ""},
-                                        }
-                                    entry = collected_tool_calls[idx]
-                                    if tc.get("id"):
-                                        entry["id"] = tc["id"]
-                                    func = tc.get("function", {})
-                                    if func.get("name"):
-                                        entry["function"]["name"] += func["name"]
-                                    if func.get("arguments"):
-                                        entry["function"]["arguments"] += func["arguments"]
-                            # 提取并合并 thinking 增量数据（CCR 兼容）
-                            thinking_delta = meta_update.pop("_thinking_delta", None)
-                            if isinstance(thinking_delta, dict):
-                                if thinking_delta.get("content"):
-                                    thinking_content += thinking_delta["content"]
-                                if thinking_delta.get("signature"):
-                                    thinking_signature = thinking_delta["signature"]
+                            self._merge_tool_calls_delta(collected_tool_calls, meta_update)
+                            thinking_content, thinking_signature = self._merge_thinking_delta(
+                                thinking_content, thinking_signature, meta_update
+                            )
                             meta.update(meta_update)
 
                     # 将收集到的 tool_calls 放入 meta
@@ -541,6 +519,15 @@ class OpenAIProxy:
         url = self._build_upstream_url(provider.endpoint, endpoint, provider_format, is_stream=True)
         headers = self._build_headers(provider)
 
+        # 提前初始化，避免 with 块内变量遮蔽导致潜在的 UnboundLocalError
+        usage: Dict[str, int] = {}
+        content = ""
+        finish_reason = "stop"
+        meta: Dict[str, Any] = {"model": model_name or body.get("model")}
+        collected_tool_calls: Dict[int, dict] = {}
+        thinking_content = ""
+        thinking_signature = ""
+
         try:
             with httpx.Client(timeout=provider.timeout) as client:
                 with client.stream("POST", url, json=body, headers=headers) as response:
@@ -589,14 +576,7 @@ class OpenAIProxy:
                         return self._json_response(client_data), 200, usage.get("total_tokens", 0)
 
                     # --- 非 Responses API：保持原有逻辑 ---
-                    usage: Dict[str, int] = {}
-                    content = ""
-                    finish_reason = "stop"
-                    meta: Dict[str, Any] = {"model": model_name or body.get("model")}
                     current_event = ""
-                    collected_tool_calls: Dict[int, dict] = {}
-                    thinking_content = ""
-                    thinking_signature = ""
 
                     for line in response.iter_lines():
                         if line is None:
@@ -626,31 +606,10 @@ class OpenAIProxy:
                         if usage_update:
                             usage.update(usage_update)
                         if meta_update:
-                            tc_deltas = meta_update.pop("_tool_calls_delta", None)
-                            if tc_deltas:
-                                for tc in tc_deltas:
-                                    idx = tc.get("index", 0)
-                                    if idx not in collected_tool_calls:
-                                        collected_tool_calls[idx] = {
-                                            "id": tc.get("id", ""),
-                                            "type": "function",
-                                            "function": {"name": "", "arguments": ""},
-                                        }
-                                    entry = collected_tool_calls[idx]
-                                    if tc.get("id"):
-                                        entry["id"] = tc["id"]
-                                    func = tc.get("function", {})
-                                    if func.get("name"):
-                                        entry["function"]["name"] += func["name"]
-                                    if func.get("arguments"):
-                                        entry["function"]["arguments"] += func["arguments"]
-                            # 提取并合并 thinking 增量数据（CCR 兼容）
-                            thinking_delta = meta_update.pop("_thinking_delta", None)
-                            if isinstance(thinking_delta, dict):
-                                if thinking_delta.get("content"):
-                                    thinking_content += thinking_delta["content"]
-                                if thinking_delta.get("signature"):
-                                    thinking_signature = thinking_delta["signature"]
+                            self._merge_tool_calls_delta(collected_tool_calls, meta_update)
+                            thinking_content, thinking_signature = self._merge_thinking_delta(
+                                thinking_content, thinking_signature, meta_update
+                            )
                             meta.update(meta_update)
 
             if not usage.get("total_tokens"):
@@ -784,6 +743,46 @@ class OpenAIProxy:
 
         timer = threading.Thread(target=_safety_release, daemon=True)
         timer.start()
+
+    # ------------------------------------------------------------------
+    # 流式增量数据辅助合并
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _merge_tool_calls_delta(collected: Dict[int, dict], meta_update: Dict[str, Any]) -> None:
+        """将 meta_update 中的 _tool_calls_delta 合并到 collected 字典。"""
+        tc_deltas = meta_update.pop("_tool_calls_delta", None)
+        if not tc_deltas:
+            return
+        for tc in tc_deltas:
+            idx = tc.get("index", 0)
+            if idx not in collected:
+                collected[idx] = {
+                    "id": tc.get("id", ""),
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                }
+            entry = collected[idx]
+            if tc.get("id"):
+                entry["id"] = tc["id"]
+            func = tc.get("function", {})
+            if func.get("name"):
+                entry["function"]["name"] += func["name"]
+            if func.get("arguments"):
+                entry["function"]["arguments"] += func["arguments"]
+
+    @staticmethod
+    def _merge_thinking_delta(
+        thinking_content: str, thinking_signature: str, meta_update: Dict[str, Any],
+    ) -> Tuple[str, str]:
+        """将 meta_update 中的 _thinking_delta 合并，返回更新后的 (content, signature)。"""
+        thinking_delta = meta_update.pop("_thinking_delta", None)
+        if isinstance(thinking_delta, dict):
+            if thinking_delta.get("content"):
+                thinking_content += thinking_delta["content"]
+            if thinking_delta.get("signature"):
+                thinking_signature = thinking_delta["signature"]
+        return thinking_content, thinking_signature
 
     # ------------------------------------------------------------------
     # 错误响应

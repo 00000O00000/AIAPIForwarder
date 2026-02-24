@@ -412,7 +412,12 @@ class FormatConverter:
         if "tools" in body:
             result["tools"] = cu.openai_tools_to_claude_tools(body.get("tools") or [])
         if "tool_choice" in body:
-            result["tool_choice"] = cu.convert_tool_choice_to_claude(body.get("tool_choice"))
+            claude_tc = cu.convert_tool_choice_to_claude(body.get("tool_choice"))
+            if isinstance(claude_tc, dict) and claude_tc.get("type") == "none":
+                # Claude 不支持 none，移除 tools 和 tool_choice 以禁用工具
+                result.pop("tools", None)
+            else:
+                result["tool_choice"] = claude_tc
         # 还原 Claude thinking 字段
         if "_claude_thinking" in body:
             result["thinking"] = body["_claude_thinking"]
@@ -723,7 +728,11 @@ class FormatConverter:
                 if item_type == "message":
                     # 提取 reasoning
                     if item.get("reasoning"):
-                        thinking_data = {"content": item.get("reasoning", "")}
+                        reasoning = item.get("reasoning", {})
+                        if isinstance(reasoning, dict):
+                            thinking_data = {"content": reasoning.get("content", ""), "signature": reasoning.get("signature", "")}
+                        else:
+                            thinking_data = {"content": str(reasoning)}
                     for content_block in cu.safe_list(item.get("content")):
                         if not isinstance(content_block, dict):
                             continue
@@ -926,7 +935,7 @@ class FormatConverter:
         # CCR: usage 中包含 cache_read_input_tokens
         prompt_tokens_details = usage.get("prompt_tokens_details", {}) or {}
         cached_tokens = prompt_tokens_details.get("cached_tokens", 0) or 0
-        input_tokens = (usage.get("prompt_tokens", 0) or 0) - cached_tokens
+        input_tokens = max(0, (usage.get("prompt_tokens", 0) or 0) - cached_tokens)
         return {
             "id": openai_data.get("id", f"msg_{int(time.time() * 1000)}"),
             "type": "message",
@@ -947,11 +956,28 @@ class FormatConverter:
         usage = openai_data.get("usage", {})
         candidates = []
         for choice in openai_data.get("choices", []):
-            text = cu.openai_content_to_text(choice.get("message", {}).get("content", ""))
+            message = choice.get("message", {})
+            text = cu.openai_content_to_text(message.get("content", ""))
+            parts: List[dict] = [{"text": text}]
+            # tool_calls → functionCall parts
+            for tc in cu.safe_list(message.get("tool_calls")):
+                if not isinstance(tc, dict):
+                    continue
+                func = tc.get("function", {})
+                raw_args = func.get("arguments", "{}")
+                if isinstance(raw_args, str):
+                    try:
+                        args = json.loads(raw_args)
+                    except Exception:
+                        args = {"raw": raw_args}
+                else:
+                    args = raw_args
+                parts.append({"functionCall": {"name": func.get("name", "tool"), "args": args}})
+            finish_reason = cu.openai_finish_to_gemini(choice.get("finish_reason"))
             candidates.append({
                 "index": choice.get("index", 0),
-                "content": {"role": "model", "parts": [{"text": text}]},
-                "finishReason": cu.openai_finish_to_gemini(choice.get("finish_reason")),
+                "content": {"role": "model", "parts": parts},
+                "finishReason": finish_reason,
             })
         return {
             "candidates": candidates,

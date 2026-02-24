@@ -1,32 +1,54 @@
-# AI API Gateway
+# AI API 转发网关
+
+> 
+> 你是否苦恼于，大量调用AI，带来了昂贵的成本？
+>
+> 你是否苦恼于，自己有很多免费的AI渠道，但每个渠道都有各种限制，一会就到上限了。只能手动切换模型？
+>
+> 那就部署这个项目吧，把你的所有免费渠道全部整合起来，让本项目为你自动选择合适的AI！
+>
 
 轻量级 AI 接口网关，支持：
-- 多提供商调度（优先级 + 权重）
+- 多提供商自动调度（优先级 + 权重）
 - 自动重试与故障切换
-- OpenAI / Claude / Gemini 请求格式兼容
+- OpenAI / OpenAI-Resopnse / Claude / Gemini 多请求格式兼容
 - 上游协议格式自动转换（`openai` / `openai-response` / `claude` / `gemini`）
 - Provider 限额与周期重置
-- Provider 级并发上限（`rate_limit.max_worker`）
+- 并发上限与自动调度（`rate_limit.max_worker`）
 
 ## 快速开始
 
 1. 配置 `config/provider.json`
+  - 配置文件示例见`config/provider.example.json`，可删除`.example`字符串，直接修改。
+
 2. 启动：
 
 ```bash
-docker-compose up -d
+docker-compose up -d --build
 ```
 
-3. 验证：
+3. 验证服务可用性：
 
 ```bash
 curl http://localhost:6010/health
 curl http://localhost:6010/v1/models
 ```
 
-## 配置示例
+## 模型提供商推荐
 
-见：`config/provider.example.json`
+1. 官方免费提供商
+  - [ModelScope魔搭](https://www.modelscope.cn/)：Qwen3、Deepseek、GLM系列，每天刷新调用次数，不限制Token
+  - [iflow心流](https://platform.iflow.cn/models)：Qwen3、Deepseek、Kimi系列，只限制并发为1，用量、RPM等完全不限制
+  - [NVIDIA英伟达开发平台](https://build.nvidia.com/explore/discover)：Qwen3.5、Kimi等大量模型
+  - [ChatAnyWhere](https://github.com/popjane/free_chatgpt_api)：Deepseek系列，每天30次免费调用，不限制Token
+
+2. 特定模型免费提供
+  - [FreeQwQ](https://qwq.aigpu.cn/)：提供部分Qwen系列模型调用，免费无限制
+  - [BigModel智谱清言](https://open.bigmodel.cn/)：`glm-4.7-flash`模型完全免费，仅限制并发为1
+
+---
+
+# 技术细节
 
 ## 调度流程
 

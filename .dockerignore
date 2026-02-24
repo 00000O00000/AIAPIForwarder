@@ -1,0 +1,30 @@
+# 版本控制
+.git
+.gitignore
+
+# Python 缓存
+__pycache__
+*.py[cod]
+*$py.class
+*.egg-info
+
+# 虚拟环境
+.venv
+venv
+env
+
+# 运行时数据（通过 volume 挂载）
+data/
+logs/
+
+# IDE
+.vscode
+.idea
+.cursor*
+
+# 杂项
+*.md
+LICENSE
+normalize_utf8.py
+.dockerignore
+docker-compose.yml

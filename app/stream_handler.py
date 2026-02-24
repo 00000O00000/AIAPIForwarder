@@ -239,7 +239,7 @@ class StreamHandler:
         # CCR: usage 中包含 cache_read_input_tokens
         prompt_tokens_details = usage.get("prompt_tokens_details", {}) or {}
         cached_tokens = prompt_tokens_details.get("cached_tokens", 0) or 0
-        input_tokens = (usage.get("prompt_tokens", 0) or 0) - cached_tokens
+        input_tokens = max(0, (usage.get("prompt_tokens", 0) or 0) - cached_tokens)
 
         yield "event: message_delta\n"
         yield f"data: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'input_tokens': input_tokens, 'output_tokens': usage.get('completion_tokens', 0) or 0, 'cache_read_input_tokens': cached_tokens}})}\n\n"
@@ -271,6 +271,17 @@ class StreamHandler:
     def _iter_openai_stream(self, response_data: dict) -> Iterable[str]:
         """生成 OpenAI 格式的 SSE 流。"""
         for choice in response_data.get("choices", []):
+            message = choice.get("message", {})
+            delta: Dict[str, Any] = {
+                "role": "assistant",
+                "content": cu.openai_content_to_text(message.get("content", "")),
+            }
+            # tool_calls 透传
+            if message.get("tool_calls"):
+                delta["tool_calls"] = message["tool_calls"]
+            # thinking 透传
+            if message.get("thinking"):
+                delta["thinking"] = message["thinking"]
             chunk = {
                 "id": response_data.get("id", ""),
                 "object": "chat.completion.chunk",
@@ -279,10 +290,7 @@ class StreamHandler:
                 "choices": [
                     {
                         "index": choice.get("index", 0),
-                        "delta": {
-                            "role": "assistant",
-                            "content": cu.openai_content_to_text(choice.get("message", {}).get("content", "")),
-                        },
+                        "delta": delta,
                         "finish_reason": choice.get("finish_reason"),
                     }
                 ],
@@ -420,12 +428,14 @@ class StreamHandler:
 
         # --- response.reasoning_summary_part.done → thinking signature ---
         if event_type == "response.reasoning_summary_part.done" and data.get("part"):
+            part = data.get("part", {})
+            signature = part.get("signature", "") if isinstance(part, dict) else ""
             return _make_chunk(
                 data.get("item_id", ""),
                 (data.get("response") or {}).get("model", ""),
                 [{
                     "index": index_state.get("current_index", 0),
-                    "delta": {"thinking": {"signature": data.get("item_id", "")}},
+                    "delta": {"thinking": {"signature": signature}},
                     "finish_reason": None,
                 }],
             )

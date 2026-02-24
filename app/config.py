@@ -19,7 +19,6 @@ class ConfigManager:
 
     def __init__(self, config_path: Optional[str] = None):
         self.config_path = self._resolve_config_path(config_path)
-        self.data_dir = self._resolve_usage_dir()
         self._config: Dict[str, Any] = {}
         self._global_config: GlobalConfig = GlobalConfig()
         self._models: Dict[str, ModelConfig] = {}
@@ -39,15 +38,6 @@ class ConfigManager:
             return local_candidate
 
         return candidate
-
-    @staticmethod
-    def _resolve_usage_dir() -> str:
-        candidate = os.getenv("USAGE_DATA_DIR", "/app/data/usage")
-        if os.path.isdir(candidate):
-            return candidate
-
-        local_candidate = os.path.join("data", "usage")
-        return local_candidate if os.path.isdir("data") else candidate
 
     def _load_config(self):
         """Load provider configuration from JSON file."""

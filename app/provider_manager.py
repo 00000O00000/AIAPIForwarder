@@ -58,7 +58,7 @@ class ProviderManager:
         self, model_name: str, provider: ProviderConfig,
     ) -> Tuple[bool, str, str]:
         """
-        在锁内原子地完成 rate_limit 检查 + worker 获取。
+        先检查 rate_limit 可用性（锁外），再在锁内获取 worker。
         返回 (acquired, reason, fail_type):
           - fail_type: "rate_limited" / "max_worker" / "" (成功时为空)
         """
@@ -267,7 +267,7 @@ class ProviderManager:
         if len(providers) == 1:
             return providers[0]
 
-        weights = [max(0, p.weight) for p in providers]
+        weights = [max(1, p.weight) for p in providers]
         total_weight = sum(weights)
         if total_weight <= 0:
             return random.choice(providers)
