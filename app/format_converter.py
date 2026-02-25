@@ -29,33 +29,12 @@ class FormatConverter:
     # ------------------------------------------------------------------
 
     def detect_client_format(self, body: dict, endpoint: str) -> str:
-        """检测请求体的客户端格式。"""
-        if endpoint != "/chat/completions":
-            return CLIENT_FORMAT_OPENAI
-        if "contents" in body or "generationConfig" in body or "systemInstruction" in body:
-            return CLIENT_FORMAT_GEMINI
-        if "anthropic_version" in body or "stop_sequences" in body or "anthropic_beta" in body:
-            return CLIENT_FORMAT_CLAUDE
-        if "system" in body and "messages" in body:
-            return CLIENT_FORMAT_CLAUDE
-        if self._looks_like_claude_messages(body.get("messages")):
-            return CLIENT_FORMAT_CLAUDE
-        return CLIENT_FORMAT_OPENAI
+        """基于端点判定客户端格式。
 
-    @staticmethod
-    def _looks_like_claude_messages(messages: Any) -> bool:
-        """判断消息列表是否是 Claude 格式。"""
-        if not isinstance(messages, list) or not messages:
-            return False
-        for msg in messages:
-            if not isinstance(msg, dict):
-                continue
-            content = msg.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") in ("text", "image", "tool_use", "tool_result"):
-                        return True
-        return False
+        Claude 和 Gemini 格式通过路由处理器的 forced_client_format 强制指定，
+        此处仅处理未强制指定的情况，统一返回 OpenAI 格式。
+        """
+        return CLIENT_FORMAT_OPENAI
 
     # ------------------------------------------------------------------
     # 客户端 → OpenAI 内部格式
